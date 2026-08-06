@@ -17,7 +17,7 @@ namespace IronNestFCS.CustomRecords;
 internal static class CoverImage
 {
     private const int CanvasSize = 1024;
-    private const int CoverSize = 412;
+    private const int CoverSize = 1024;
     // 底色 #0B0B0B，完全不透明。
     private static readonly Color32 Background = new Color32(0x0B, 0x0B, 0x0B, 0xFF);
 

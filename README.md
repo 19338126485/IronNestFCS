@@ -39,13 +39,14 @@
 
 ### 配置游戏路径
 
-各 `.csproj` 通过 `GameDir` 属性定位游戏目录下的 MelonLoader 程序集。请把以下两个文件里的 `GameDir` 改成你本机的游戏安装路径：
+各 `.csproj` 通过 `GameDir` 属性定位游戏目录下的 MelonLoader 程序集。请把以下三个文件里的 `GameDir` 改成你本机的游戏安装路径：
 
 - [IronNestFCS/IronNestFCS.csproj](IronNestFCS/IronNestFCS.csproj)
 - [IronNestFCS.Logic/IronNestFCS.Logic.csproj](IronNestFCS.Logic/IronNestFCS.Logic.csproj)
+- [IronNestFCS.CustomRecords/IronNestFCS.CustomRecords.csproj](IronNestFCS.CustomRecords/IronNestFCS.CustomRecords.csproj)
 
 ```xml
-<GameDir>你的路径\IRON NEST Heavy Turret Simulator Demo</GameDir>
+<GameDir>你的路径\Iron Nest Heavy Turret Simulator</GameDir>
 ```
 
 ### 构建

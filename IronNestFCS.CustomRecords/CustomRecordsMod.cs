@@ -30,22 +30,40 @@ public class CustomRecordsMod : MelonMod
     // 每张克隆盘各自持有的流式音轨状态：PCMReaderCallback 按需供数，必须保活托管侧
     // 样本缓冲与读游标，否则被 GC 回收后回调里访问就是野指针。模块存活期间一直持有。
     private readonly List<TrackPlayback> playbacks = new();
-    private bool done;
 
-    public override void OnUpdate()
-    {
-        if (done)
-            return;
+    private void Cleanup() {
+        foreach (var clone in diskClones)
+        {
+            if (clone != null)
+                Object.Destroy(clone);
+        }
+        diskClones.Clear();
+        playbacks.Clear();
+    }
+    
+    public override void OnSceneWasLoaded(int buildIndex, string sceneName) {
+        Cleanup();
 
         // 轮询 RecordDisk 出现即执行一次。
-        var src = GameObject.Find("RecordDisk");
-        if (src == null)
-            return;
+        GameObject? src = null;
+        var surface = GameObject.Find("Record Player").transform.FindChild("Drag Surface").transform;
+        var records = new List<Transform>();
+        for (var i = 0; i < surface.childCount; ++i) {
+            var t = surface.GetChild(i);
+            if (!t.GetComponent<RecordItem>()) continue;
+            records.Add(t);
+        }
+        records = records.Where((t) => t.gameObject.activeSelf).ToList();
+        src = records.FirstOrDefault()?.gameObject;
 
-        done = true;
+        if (src == null) {
+            MelonLogger.Warning("[CustomRecords] No RecordDisk found in scene, skipping.");    
+            return;
+        }
+        
         try
         {
-            CreateCustomRecordss(src);
+            CreateCustomRecords(src);
         }
         catch (Exception ex)
         {
@@ -55,20 +73,14 @@ public class CustomRecordsMod : MelonMod
 
     public override void OnDeinitializeMelon()
     {
-        foreach (var clone in diskClones)
-        {
-            if (clone != null)
-                Object.Destroy(clone);
-        }
-        diskClones.Clear();
-        playbacks.Clear();
+        Cleanup();
     }
 
     /// <summary>
     /// 列出 CustomRecords 里所有受支持且带封面的文件，逐个克隆 RecordDisk 并装配。
     /// 多张盘沿原盘朝同一方向依次排开，避免叠在一起。
     /// </summary>
-    private void CreateCustomRecordss(GameObject src)
+    private void CreateCustomRecords(GameObject src)
     {
         var dir = System.IO.Path.Combine(MelonEnvironment.UserDataDirectory, "CustomRecords");
         if (!System.IO.Directory.Exists(dir))
@@ -167,7 +179,14 @@ public class CustomRecordsMod : MelonMod
 
         // 替换唱片贴图。
         var renderer = recordItem.transform.FindChild("Record Disk Blend").GetComponent<MeshRenderer>();
-        renderer.material.mainTexture = tex;
+
+        // for (var i = 0; i < renderer.materials.Length; ++i) {
+        //     var mat = renderer.materials[i];
+        //     if (mat == null) continue;
+        //     ExportMaterialTextures(mat, System.IO.Path.GetFileName(file) + "_" + i);
+        // }
+
+        renderer.materials.ElementAt(1).mainTexture = tex;
 
         // 尽力设置显示名（字段在不同版本可能不同，存在才设）。
         TrySetDisplayName(recordItem, TagReader.ReadTitle(file));
@@ -175,6 +194,93 @@ public class CustomRecordsMod : MelonMod
         MelonLogger.Msg($"[CustomRecords] + {System.IO.Path.GetFileName(file)}  " +
                         $"({(float)(samples.Length / channels) / sampleRate:F1}s, {channels}ch@{sampleRate}Hz)");
         return true;
+    }
+
+    /// <summary>
+    /// 将材质所有非空纹理属性导出为 StreamingAssets 下的 PNG。
+    /// 先经 RenderTexture 读回，因而也支持资源包中不可读的 Texture2D。
+    /// </summary>
+    private static void ExportMaterialTextures(Material material, string sourceFileName)
+    {
+        var outputDirectory = Application.streamingAssetsPath;
+        System.IO.Directory.CreateDirectory(outputDirectory);
+
+        var propertyNames = material.GetTexturePropertyNames();
+        for (int i = 0; i < propertyNames.Length; i++)
+        {
+            var propertyName = propertyNames[i];
+            var texture = material.GetTexture(propertyName);
+            if (texture == null)
+                continue;
+
+            var outputName = $"{SanitizeFileName(sourceFileName)}_{SanitizeFileName(propertyName)}.png";
+            var outputPath = System.IO.Path.Combine(outputDirectory, outputName);
+
+            try
+            {
+                SaveTextureAsPng(texture, outputPath);
+                MelonLogger.Msg($"[CustomRecords] Exported {propertyName} ({texture.name}) -> {outputPath}");
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[CustomRecords] Failed to export {propertyName} ({texture.name}): {ex.Message}");
+            }
+        }
+    }
+
+    private static void SaveTextureAsPng(Texture source, string outputPath)
+    {
+        if (source.width <= 0 || source.height <= 0)
+            throw new InvalidOperationException($"Invalid texture size: {source.width}x{source.height}");
+
+        RenderTexture? renderTexture = null;
+        Texture2D? readableTexture = null;
+        var previousRenderTexture = RenderTexture.active;
+
+        try
+        {
+            renderTexture = RenderTexture.GetTemporary(
+                source.width,
+                source.height,
+                0,
+                RenderTextureFormat.ARGB32,
+                RenderTextureReadWrite.Default);
+            Graphics.Blit(source, renderTexture, new Vector2(1f, 1f), Vector2.zero, 0, 0);
+
+            RenderTexture.active = renderTexture;
+            readableTexture = new Texture2D(source.width, source.height, TextureFormat.RGBA32, false);
+            readableTexture.ReadPixels(new Rect(0f, 0f, source.width, source.height), 0, 0, false);
+            readableTexture.Apply();
+
+            var encoded = ImageConversion.EncodeToPNG(readableTexture);
+            if (encoded == null || encoded.Length == 0)
+                throw new InvalidOperationException("PNG encoding returned no data.");
+
+            var png = new byte[encoded.Length];
+            for (int i = 0; i < encoded.Length; i++)
+                png[i] = encoded[i];
+            System.IO.File.WriteAllBytes(outputPath, png);
+        }
+        finally
+        {
+            RenderTexture.active = previousRenderTexture;
+            if (readableTexture != null)
+                Object.Destroy(readableTexture);
+            if (renderTexture != null)
+                RenderTexture.ReleaseTemporary(renderTexture);
+        }
+    }
+
+    private static string SanitizeFileName(string value)
+    {
+        var invalidChars = System.IO.Path.GetInvalidFileNameChars();
+        var chars = value.ToCharArray();
+        for (int i = 0; i < chars.Length; i++)
+        {
+            if (Array.IndexOf(invalidChars, chars[i]) >= 0)
+                chars[i] = '_';
+        }
+        return new string(chars);
     }
 
     /// <summary>
@@ -203,11 +309,8 @@ public class CustomRecordsMod : MelonMod
     /// </summary>
     private static void TrySetDisplayName(RecordItem recordItem, string title)
     {
-        try
-        {
-            var prop = recordItem.GetType().GetProperty("displayName");
-            if (prop != null && prop.PropertyType == typeof(string) && prop.CanWrite)
-                prop.SetValue(recordItem, title);
+        try {
+            recordItem.gameObject.name = title;
         }
         catch
         {
