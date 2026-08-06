@@ -42,14 +42,14 @@ public class TriggerConsole {
     }
 
     public void Fire() {
-        _fire.AddEnergy(255);
+        _fire?.AddEnergy(255);
     }
 
     public IEnumerator Arm(LeftRight leftRight) {
         var arm = leftRight == LeftRight.Left ? _armLeft : _armRight;
-        arm.OnClickDown();
+        arm?.OnClickDown();
         yield return new WaitForSeconds(0.2f);
-        arm.OnClickUp();
+        arm?.OnClickUp();
         yield return new WaitForSeconds(1f);
     }
     

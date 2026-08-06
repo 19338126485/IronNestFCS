@@ -4,6 +4,7 @@ using Il2Cpp;
 using IronNestFCS.Logic.FCS;
 using MelonLoader;
 using UnityEngine;
+using UnityEngine.InputSystem;
 using UnityEngine.UI;
 
 namespace IronNestFCS.Logic;
@@ -124,9 +125,10 @@ public class FSC
     public IEnumerator ExposeAllEntities() {
         while (true) {
             foreach (var m in MapTable.GetAllFireMissionEntities()) {
-                m.GetComponent<Image>().enabled = true;
+                var vr = m.transform.FindChild("VisualRoot");
+                vr.gameObject.SetActive(true);
+                vr.FindChild("Info").gameObject.SetActive(true);
             }
-
             yield return new WaitForSeconds(1f);
         }
     }
