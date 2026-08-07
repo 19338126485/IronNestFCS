@@ -5,10 +5,10 @@ using Object = UnityEngine.Object;
 namespace IronNestFCS.CustomRecords;
 
 /// <summary>
-/// 把音频内嵌封面字节合成成唱片贴图：
-/// 1) 建一张 1024x1024、整张填充 #0B0B0B 的底图；
-/// 2) 把封面等比/拉伸缩放到 412x412，贴在正中央；
-/// 3) 用直径 412 的圆形遮罩把这块封面裁成圆形（圆外恢复成底色），边缘做 1px 抗锯齿。
+/// 把封面图片字节转换成中心封面贴图：任意分辨率的图片（含非 2 次幂）直接双线性拉伸
+/// 填充到整张 1024x1024 贴图，替换盘面 Record Disk Blend 材质的 CoverArt 槽位
+/// （游戏结构：mat[0]=VinylRecord 整体黑胶、mat[1]=CoverArt 中心封面——只替换封面槽位，
+/// 黑胶槽位保持原样，即"整体纯黑胶 + 中心封面图"的原版样式）。
 ///
 /// 全程只用了 IL2CPP 裁剪后仍保留的 Texture2D API：LoadImage / GetPixels32 /
 /// SetPixels32 / Apply（已验证这些在 UnityEngine.CoreModule interop stub 里存在）。
@@ -17,12 +17,9 @@ namespace IronNestFCS.CustomRecords;
 internal static class CoverImage
 {
     private const int CanvasSize = 1024;
-    private const int CoverSize = 1024;
-    // 底色 #0B0B0B，完全不透明。
-    private static readonly Color32 Background = new Color32(0x0B, 0x0B, 0x0B, 0xFF);
 
     /// <summary>
-    /// 从封面原始字节(PNG/JPEG)构造合成后的 1024x1024 唱片贴图。
+    /// 从封面原始字节(PNG/JPEG)构造整幅拉伸的 1024x1024 封面贴图。
     /// 解码失败返回 null（调用方应跳过该文件）。
     /// </summary>
     internal static Texture2D? Build(byte[] coverBytes)
@@ -37,62 +34,21 @@ internal static class CoverImage
 
         int srcW = srcTex.width, srcH = srcTex.height;
         // GetPixels32 返回交错的 Color32[]，行序自底向上（Unity 约定）。
-        // 我们整套合成都在这个“自底向上”的坐标系里做，圆形对称所以上下翻转无所谓。
+        // 整幅拉伸不涉及方向敏感的操作，行序差异无影响。
         Color32[] src = ToManaged(srcTex.GetPixels32());
         Object.Destroy(srcTex); // 源纹理用完即弃。
 
-        // 1) 把封面缩放到 412x412（双线性）。
-        Color32[] cover = ScaleBilinear(src, srcW, srcH, CoverSize, CoverSize);
+        // 任意分辨率 → 双线性拉伸填充整张 1024x1024。
+        Color32[] full = ScaleBilinear(src, srcW, srcH, CanvasSize, CanvasSize);
 
-        // 2) 建 1024x1024 底图，整张填 #0B0B0B。
-        var canvas = new Color32[CanvasSize * CanvasSize];
-        for (int i = 0; i < canvas.Length; i++)
-            canvas[i] = Background;
-
-        // 3) 居中贴入并按圆形遮罩混合。
-        int offset = (CanvasSize - CoverSize) / 2; // 306
-        float radius = CoverSize / 2f;             // 206
-        float cx = (CoverSize - 1) / 2f;
-        float cy = (CoverSize - 1) / 2f;
-
-        for (int y = 0; y < CoverSize; y++)
-        {
-            for (int x = 0; x < CoverSize; x++)
-            {
-                float dx = x - cx;
-                float dy = y - cy;
-                float dist = Mathf.Sqrt(dx * dx + dy * dy);
-
-                // 圆外直接保持底色；圆内用封面色；边缘 1px 做线性 alpha 抗锯齿。
-                float coverage = Mathf.Clamp01(radius - dist); // dist<=r-1→1, dist>=r→0
-                if (coverage <= 0f)
-                    continue;
-
-                int ci = y * CoverSize + x;
-                int canvasIdx = (y + offset) * CanvasSize + (x + offset);
-                Color32 fg = cover[ci];
-                if (coverage >= 1f)
-                {
-                    canvas[canvasIdx] = new Color32(fg.r, fg.g, fg.b, 0xFF);
-                }
-                else
-                {
-                    // 与底色按 coverage 混合，得到柔和圆边。
-                    Color32 bg = canvas[canvasIdx];
-                    canvas[canvasIdx] = LerpRgb(bg, fg, coverage);
-                }
-            }
-        }
-
-        // 写回一张正式纹理。
         var outTex = new Texture2D(CanvasSize, CanvasSize, TextureFormat.RGBA32, false);
-        outTex.SetPixels32(new Il2CppStructArray<Color32>(canvas));
+        outTex.SetPixels32(new Il2CppStructArray<Color32>(full));
         outTex.Apply();
         return outTex;
     }
 
     /// <summary>Il2Cpp Color32 数组拷成托管数组，便于在托管侧高速随机访问。</summary>
-    private static Color32[] ToManaged(Il2CppStructArray<Color32> arr)
+    internal static Color32[] ToManaged(Il2CppStructArray<Color32> arr)
     {
         var managed = new Color32[arr.Length];
         for (int i = 0; i < arr.Length; i++)
@@ -152,15 +108,5 @@ internal static class CoverImage
             (byte)(top_g + (bot_g - top_g) * wy),
             (byte)(top_b + (bot_b - top_b) * wy),
             (byte)(top_a + (bot_a - top_a) * wy));
-    }
-
-    /// <summary>按 t 在两色间线性插值 RGB，结果不透明。</summary>
-    private static Color32 LerpRgb(Color32 a, Color32 b, float t)
-    {
-        return new Color32(
-            (byte)(a.r + (b.r - a.r) * t),
-            (byte)(a.g + (b.g - a.g) * t),
-            (byte)(a.b + (b.b - a.b) * t),
-            0xFF);
     }
 }

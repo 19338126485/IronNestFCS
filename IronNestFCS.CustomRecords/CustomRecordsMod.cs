@@ -7,7 +7,7 @@ using UnityEngine;
 using Object = UnityEngine.Object;
 
 [assembly: MelonInfo(typeof(IronNestFCS.CustomRecords.CustomRecordsMod), 
-    "IronNestFCS.CustomRecords", "1.0.1", "svr2kos2")]
+    "IronNestFCS.CustomRecords", "1.0.2", "svr2kos2")]
 [assembly: MelonGame("Iron Nest", "Iron Nest: Heavy Turret Simulator")]
 
 namespace IronNestFCS.CustomRecords;
@@ -21,8 +21,9 @@ namespace IronNestFCS.CustomRecords;
 /// 也不再从 StreamingAssets 读取素材。
 ///
 /// 解码与标签读取走纯托管库（NAudio / NAudio.Flac / TagLib#），不受本作 IL2CPP 裁剪影响；
-/// 只有“把结果塞回 Unity”这一步受 IL2CPP 约束，沿用已验证可用的 API（见各处注释）。
-/// 进场景后轮询 RecordDisk，出现时执行一次。
+/// 只有"把结果塞回 Unity"这一步受 IL2CPP 约束，沿用已验证可用的 API（见各处注释）。
+/// 进场景后轮询唱片对象（兼容 Demo 版的精确名 "RecordDisk" 与正式版的
+/// "RecordDisk 1"~"RecordDisk 13" 命名），出现时执行一次；切换场景自动重置。
 /// </summary>
 public class CustomRecordsMod : MelonMod
 {
@@ -30,8 +31,132 @@ public class CustomRecordsMod : MelonMod
     // 每张克隆盘各自持有的流式音轨状态：PCMReaderCallback 按需供数，必须保活托管侧
     // 样本缓冲与读游标，否则被 GC 回收后回调里访问就是野指针。模块存活期间一直持有。
     private readonly List<TrackPlayback> playbacks = new();
+    private bool done;
+    private bool reportedMissing;
+    private bool candidatesLogged;
+    // 场景加载时刻（Time.realtimeSinceStartup）：相机渲染一两帧后 Renderer.isVisible 才可靠，
+    // 宽限期内不把盘放到"不可见模板"的位置。
+    private float sceneLoadedAt;
+    private const float VisibleWaitSeconds = 5f;
 
-    private void Cleanup() {
+    public override void OnUpdate()
+    {
+        if (done)
+            return;
+
+        // 轮询模板盘出现即执行一次。
+        var src = FindRecordDiskTemplate();
+        if (src == null)
+        {
+            // 找不到时只提示一次，避免每帧刷屏；场景切换后重置再提示。
+            if (!reportedMissing)
+            {
+                reportedMissing = true;
+                MelonLogger.Msg("[CustomRecords] Waiting for a record disk in the scene...");
+            }
+            return;
+        }
+
+        done = true;
+        try
+        {
+            CreateCustomRecordss(src);
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Error($"[CustomRecords] Failed to create custom disks: {ex}");
+        }
+    }
+
+    /// <summary>
+    /// 场景切换：旧克隆盘随场景卸载自动销毁，这里清空托管侧状态并重置标志，
+    /// 使新场景中再次轮询创建。避免"done 一次置位永不重试"导致换场景后不再生成。
+    /// </summary>
+    public override void OnSceneWasLoaded(int buildIndex, string sceneName)
+    {
+        diskClones.Clear();
+        playbacks.Clear();
+        done = false;
+        reportedMissing = false;
+        candidatesLogged = false;
+        sceneLoadedAt = Time.realtimeSinceStartup;
+    }
+
+    /// <summary>
+    /// 定位可作模板的唱片对象，按优先级：
+    /// 1) 精确名 "RecordDisk"（Demo 版场景）；
+    /// 2) 正式版场景中唱片对象名为 "RecordDisk 5.2_Somber" 等带编号/曲名的命名盘。
+    ///    排除我们此前克隆产生的 "(Clone)" 对象（避免链式克隆，盘越积越多）；
+    ///    优先选择"渲染器可见"（enabled && isVisible）的盘——场景中大量唱片位于
+    ///    桌子内部/地下等不可见位置，activeInHierarchy 不足以区分可见性；
+    /// 3) 场景加载初期相机尚未渲染，isVisible 暂不可靠，宽限期（VisibleWaitSeconds）内
+    ///    继续等待下一帧，避免把新盘放到隐藏位置；超时才回退到任意命名盘。
+    /// </summary>
+    private GameObject FindRecordDiskTemplate()
+    {
+        var exact = GameObject.Find("RecordDisk");
+        if (exact != null)
+            return exact;
+
+        var items = Object.FindObjectsOfType<RecordItem>(true);
+
+        // 诊断：场景首次查找时打印全部候选（名称/坐标/父对象/可见性），
+        // 便于确认真实可见盘的判别特征。
+        if (!candidatesLogged && items.Length > 0)
+        {
+            candidatesLogged = true;
+            foreach (var item in items)
+            {
+                var go = item.gameObject;
+                var r = go.GetComponentInChildren<MeshRenderer>(true);
+                string parent = go.transform.parent != null ? go.transform.parent.name : "(null)";
+                MelonLogger.Msg($"[CustomRecords] cand: {go.name} @ {go.transform.position} " +
+                                $"parent={parent} active={go.activeInHierarchy} " +
+                                $"visible={(r != null && r.enabled && r.isVisible)}");
+            }
+        }
+
+        GameObject named = null, namedVisible = null, any = null, anyVisible = null;
+        foreach (var item in items)
+        {
+            var go = item.gameObject;
+            if (go.name.Contains("(Clone)"))
+                continue; // 排除此前创建的克隆盘
+            if (go.name.StartsWith("RecordDisk"))
+            {
+                named ??= go;
+                if (IsRenderedVisible(go))
+                    namedVisible ??= go;
+            }
+            else
+            {
+                any ??= go;
+                if (IsRenderedVisible(go))
+                    anyVisible ??= go;
+            }
+        }
+
+        if (namedVisible != null)
+            return namedVisible;
+        if (Time.realtimeSinceStartup - sceneLoadedAt < VisibleWaitSeconds)
+            return null; // 宽限期内等相机渲染出可见性，再创建
+        return named ?? anyVisible ?? any;
+    }
+
+    /// <summary>对象自身或子物体存在"启用且可见"的 MeshRenderer。</summary>
+    private static bool IsRenderedVisible(GameObject go)
+    {
+        var renderers = go.GetComponentsInChildren<MeshRenderer>(true);
+        foreach (var r in renderers)
+        {
+            if (r.enabled && r.isVisible)
+                return true;
+        }
+        return false;
+    }
+
+    public override void OnDeinitializeMelon()
+    {
         foreach (var clone in diskClones)
         {
             if (clone != null)
@@ -40,47 +165,12 @@ public class CustomRecordsMod : MelonMod
         diskClones.Clear();
         playbacks.Clear();
     }
-    
-    public override void OnSceneWasLoaded(int buildIndex, string sceneName) {
-        Cleanup();
-
-        // 轮询 RecordDisk 出现即执行一次。
-        GameObject? src = null;
-        var surface = GameObject.Find("Record Player").transform.FindChild("Drag Surface").transform;
-        var records = new List<Transform>();
-        for (var i = 0; i < surface.childCount; ++i) {
-            var t = surface.GetChild(i);
-            if (!t.GetComponent<RecordItem>()) continue;
-            records.Add(t);
-        }
-        records = records.Where((t) => t.gameObject.activeSelf).ToList();
-        src = records.FirstOrDefault()?.gameObject;
-
-        if (src == null) {
-            MelonLogger.Warning("[CustomRecords] No RecordDisk found in scene, skipping.");    
-            return;
-        }
-        
-        try
-        {
-            CreateCustomRecords(src);
-        }
-        catch (Exception ex)
-        {
-            MelonLogger.Error($"[CustomRecords] Failed to create custom disks: {ex}");
-        }
-    }
-
-    public override void OnDeinitializeMelon()
-    {
-        Cleanup();
-    }
 
     /// <summary>
     /// 列出 CustomRecords 里所有受支持且带封面的文件，逐个克隆 RecordDisk 并装配。
     /// 多张盘沿原盘朝同一方向依次排开，避免叠在一起。
     /// </summary>
-    private void CreateCustomRecords(GameObject src)
+    private void CreateCustomRecordss(GameObject src)
     {
         var dir = System.IO.Path.Combine(MelonEnvironment.UserDataDirectory, "CustomRecords");
         if (!System.IO.Directory.Exists(dir))
@@ -110,11 +200,13 @@ public class CustomRecordsMod : MelonMod
         {
             try
             {
-                // 只处理带封面的文件——这是本 mod 的约定。无封面者跳过并提示。
-                var cover = TagReader.ReadCover(file);
+                // 封面来源：优先同名图片文件（song.mp3 配 song.png/.jpg/.jpeg，音频与图片分开存放，
+                // 无需给音频嵌入标签），回退到音频内嵌封面（TagLib 读取）。
+                var cover = ReadSidecarCover(file) ?? TagReader.ReadCover(file);
                 if (cover == null)
                 {
-                    MelonLogger.Warning($"[CustomRecords] Skip (no embedded cover): {System.IO.Path.GetFileName(file)}");
+                    MelonLogger.Warning($"[CustomRecords] Skip (no cover): {System.IO.Path.GetFileName(file)}" +
+                                        " (no sidecar image, no embedded cover)");
                     continue;
                 }
 
@@ -128,6 +220,25 @@ public class CustomRecordsMod : MelonMod
         }
 
         MelonLogger.Msg($"[CustomRecords] Done: {placed} disk(s) created from {files.Count} file(s).");
+    }
+
+    /// <summary>
+    /// 查找与音频文件同名的封面图片（song.mp3 → song.png / song.jpg / song.jpeg），
+    /// 存在则读回原始字节；找不到返回 null，由调用方回退到音频内嵌封面。
+    /// </summary>
+    private static byte[]? ReadSidecarCover(string audioPath)
+    {
+        var dir = System.IO.Path.GetDirectoryName(audioPath);
+        var baseName = System.IO.Path.GetFileNameWithoutExtension(audioPath);
+        if (dir == null)
+            return null;
+        foreach (var ext in new[] { ".png", ".jpg", ".jpeg" })
+        {
+            var p = System.IO.Path.Combine(dir, baseName + ext);
+            if (System.IO.File.Exists(p))
+                return System.IO.File.ReadAllBytes(p);
+        }
+        return null;
     }
 
     /// <summary>
@@ -162,11 +273,24 @@ public class CustomRecordsMod : MelonMod
             return false;
         }
 
-        // 克隆盘并沿原盘 -forward 方向按 index 依次错开 0.5 单位。
+        // 克隆盘并脱离原父级：模板可能在 inactive 容器或唱片机内部，继承父级会导致
+        // 克隆盘整体不可见（SetActive(true) 只激活自身，救不了 inactive 的父链）。
         var disk = Object.Instantiate(src);
         diskClones.Add(disk);
-        var pos = src.transform.position - Vector3.fwd * (0.2f * ((index > 4 ? 4 : index) + 1))
-            + Vector3.up * (0.02f * (index > 4 ? index - 4 : 0));
+        disk.transform.SetParent(null, true);
+        if (!disk.activeSelf)
+            disk.SetActive(true);
+
+        // 位置：沿模板 right 的水平分量依次排开（间距 0.5 米），高度抬高 0.02 防 Z-fighting。
+        // 不沿用原来的 -forward 偏移：正式版的盘多为平放（forward 朝上），-fwd 会把新盘
+        // 埋进桌面下方；right 方向与盘面垂直，始终是水平方向，放出来的盘必在桌上可见。
+        var dir = src.transform.right;
+        dir.y = 0f;
+        if (dir.sqrMagnitude < 0.01f)
+            dir = Vector3.right; // 模板几乎完全竖直时兜底
+        dir.Normalize();
+        var pos = src.transform.position + dir * (0.5f * ((index > 4 ? 4 : index) + 1));
+        pos.y += 0.02f;
         disk.transform.position = pos;
         disk.transform.rotation = src.transform.rotation;
 
@@ -177,110 +301,79 @@ public class CustomRecordsMod : MelonMod
         playbacks.Add(playback);
         AssignTrack(recordItem, playback, sampleRate);
 
-        // 替换唱片贴图。
-        var renderer = recordItem.transform.FindChild("Record Disk Blend").GetComponent<MeshRenderer>();
+        // 替换唱片贴图：游戏盘面为两层结构（Record Disk Blend 的 4 材质槽位）：
+        //   mat[0] VinylRecord*Albedo = 整体黑胶（保持原样，不替换）
+        //   mat[1] CoverArt_*         = 中心封面（替换为自定义封面）
+        //   mat[2]/mat[3]             = Outline Mask/Fill（不动）
+        // 注意：绝不写 MaterialPropertyBlock——MPB 是 renderer 级，会覆盖全部材质槽位，
+        // 导致合成贴图同时出现在中心与整体（此前"双黑圈"的根因）。
 
-        // for (var i = 0; i < renderer.materials.Length; ++i) {
-        //     var mat = renderer.materials[i];
-        //     if (mat == null) continue;
-        //     ExportMaterialTextures(mat, System.IO.Path.GetFileName(file) + "_" + i);
-        // }
+        // 诊断：打印每个 MeshRenderer 的材质槽位贴图名，确认替换目标。
+        foreach (var mr in recordItem.GetComponentsInChildren<MeshRenderer>(true))
+        {
+            var mats = mr.materials;
+            MelonLogger.Msg($"[CustomRecords] {mr.gameObject.name}: {mats.Length} material(s)");
+            for (int i = 0; i < mats.Length; i++)
+            {
+                var m = mats[i];
+                string main = m.mainTexture != null ? m.mainTexture.name : "";
+                string bas = m.HasProperty("_BaseMap") && m.GetTexture("_BaseMap") != null
+                    ? m.GetTexture("_BaseMap").name : "";
+                MelonLogger.Msg($"  mat[{i}] shader={m.shader?.name} main={main} base={bas}");
+            }
+        }
 
-        renderer.materials.ElementAt(1).mainTexture = tex;
+        foreach (var mr in recordItem.GetComponentsInChildren<MeshRenderer>(true))
+            SwapCoverArtTextures(mr, tex);
+        foreach (var sr in recordItem.GetComponentsInChildren<SpriteRenderer>(true))
+        {
+            MelonLogger.Msg($"[CustomRecords] renderer: {sr.gameObject.name} type=SpriteRenderer " +
+                            $"sprite={sr.sprite?.name} tex={sr.sprite?.texture?.name}");
+            var oldSprite = sr.sprite;
+            var sprite = Sprite.Create(tex, new Rect(0, 0, tex.width, tex.height),
+                new Vector2(0.5f, 0.5f), oldSprite != null ? oldSprite.pixelsPerUnit : 100f);
+            sr.sprite = sprite;
+        }
 
         // 尽力设置显示名（字段在不同版本可能不同，存在才设）。
         TrySetDisplayName(recordItem, TagReader.ReadTitle(file));
 
         MelonLogger.Msg($"[CustomRecords] + {System.IO.Path.GetFileName(file)}  " +
-                        $"({(float)(samples.Length / channels) / sampleRate:F1}s, {channels}ch@{sampleRate}Hz)");
+                        $"({(float)(samples.Length / channels) / sampleRate:F1}s, {channels}ch@{sampleRate}Hz) " +
+                        $"<- {src.name} @ {pos}");
         return true;
     }
 
     /// <summary>
-    /// 将材质所有非空纹理属性导出为 StreamingAssets 下的 PNG。
-    /// 先经 RenderTexture 读回，因而也支持资源包中不可读的 Texture2D。
+    /// 只替换 <see cref="MeshRenderer"/> 材质数组中贴图名以 "CoverArt" 开头的槽位
+    /// （中心封面层），整体黑胶（VinylRecord*）与描边（Outline*）槽位保持原样。
+    /// 替换方式：new Material(原材质) 生成实例副本再改贴图（不影响共享材质/原版盘），
+    /// 最后把数组赋回 renderer.materials。不写 MaterialPropertyBlock（renderer 级，
+    /// 会覆盖全部槽位）。
     /// </summary>
-    private static void ExportMaterialTextures(Material material, string sourceFileName)
+    private static void SwapCoverArtTextures(MeshRenderer r, Texture2D tex)
     {
-        var outputDirectory = Application.streamingAssetsPath;
-        System.IO.Directory.CreateDirectory(outputDirectory);
-
-        var propertyNames = material.GetTexturePropertyNames();
-        for (int i = 0; i < propertyNames.Length; i++)
+        var mats = r.materials;
+        bool changed = false;
+        for (int i = 0; i < mats.Length; i++)
         {
-            var propertyName = propertyNames[i];
-            var texture = material.GetTexture(propertyName);
-            if (texture == null)
+            var m = mats[i];
+            string main = m.mainTexture != null ? m.mainTexture.name : "";
+            string bas = m.HasProperty("_BaseMap") && m.GetTexture("_BaseMap") != null
+                ? m.GetTexture("_BaseMap").name : "";
+            if (!main.StartsWith("CoverArt") && !bas.StartsWith("CoverArt"))
                 continue;
 
-            var outputName = $"{SanitizeFileName(sourceFileName)}_{SanitizeFileName(propertyName)}.png";
-            var outputPath = System.IO.Path.Combine(outputDirectory, outputName);
-
-            try
-            {
-                SaveTextureAsPng(texture, outputPath);
-                MelonLogger.Msg($"[CustomRecords] Exported {propertyName} ({texture.name}) -> {outputPath}");
-            }
-            catch (Exception ex)
-            {
-                MelonLogger.Warning($"[CustomRecords] Failed to export {propertyName} ({texture.name}): {ex.Message}");
-            }
+            var instance = new Material(m); // 实例副本，不影响共享材质/原版盘
+            instance.mainTexture = tex;
+            if (instance.HasProperty("_BaseMap"))
+                instance.SetTexture("_BaseMap", tex);
+            mats[i] = instance;
+            changed = true;
+            MelonLogger.Msg($"[CustomRecords] swapped cover mat[{i}] ({m.name}) of {r.gameObject.name}");
         }
-    }
-
-    private static void SaveTextureAsPng(Texture source, string outputPath)
-    {
-        if (source.width <= 0 || source.height <= 0)
-            throw new InvalidOperationException($"Invalid texture size: {source.width}x{source.height}");
-
-        RenderTexture? renderTexture = null;
-        Texture2D? readableTexture = null;
-        var previousRenderTexture = RenderTexture.active;
-
-        try
-        {
-            renderTexture = RenderTexture.GetTemporary(
-                source.width,
-                source.height,
-                0,
-                RenderTextureFormat.ARGB32,
-                RenderTextureReadWrite.Default);
-            Graphics.Blit(source, renderTexture, new Vector2(1f, 1f), Vector2.zero, 0, 0);
-
-            RenderTexture.active = renderTexture;
-            readableTexture = new Texture2D(source.width, source.height, TextureFormat.RGBA32, false);
-            readableTexture.ReadPixels(new Rect(0f, 0f, source.width, source.height), 0, 0, false);
-            readableTexture.Apply();
-
-            var encoded = ImageConversion.EncodeToPNG(readableTexture);
-            if (encoded == null || encoded.Length == 0)
-                throw new InvalidOperationException("PNG encoding returned no data.");
-
-            var png = new byte[encoded.Length];
-            for (int i = 0; i < encoded.Length; i++)
-                png[i] = encoded[i];
-            System.IO.File.WriteAllBytes(outputPath, png);
-        }
-        finally
-        {
-            RenderTexture.active = previousRenderTexture;
-            if (readableTexture != null)
-                Object.Destroy(readableTexture);
-            if (renderTexture != null)
-                RenderTexture.ReleaseTemporary(renderTexture);
-        }
-    }
-
-    private static string SanitizeFileName(string value)
-    {
-        var invalidChars = System.IO.Path.GetInvalidFileNameChars();
-        var chars = value.ToCharArray();
-        for (int i = 0; i < chars.Length; i++)
-        {
-            if (Array.IndexOf(invalidChars, chars[i]) >= 0)
-                chars[i] = '_';
-        }
-        return new string(chars);
+        if (changed)
+            r.materials = mats;
     }
 
     /// <summary>
@@ -309,8 +402,11 @@ public class CustomRecordsMod : MelonMod
     /// </summary>
     private static void TrySetDisplayName(RecordItem recordItem, string title)
     {
-        try {
-            recordItem.gameObject.name = title;
+        try
+        {
+            var prop = recordItem.GetType().GetProperty("displayName");
+            if (prop != null && prop.PropertyType == typeof(string) && prop.CanWrite)
+                prop.SetValue(recordItem, title);
         }
         catch
         {

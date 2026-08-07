@@ -15,7 +15,7 @@
 - **自动击发（可选）**：通过面板上的 `Auto Fire` 开关切换是手动还是自动完成最后的击发动作。
 - **状态面板**：IMGUI 窗口实时显示两管炮的当前任务、目标参数与待派发任务数。
 - **热重载开发**：火控逻辑独立成可卸载的程序集，开发时改完代码按 **F9** 即可在不重启游戏的情况下重新加载。
-- **自定义唱片机**（附带的独立 Mod）：用自定义音频与贴图替换游戏内的 RecordDisk。
+- **自定义唱片机**（附带的独立 Mod）：把 `UserData/CustomRecords/` 下的音频文件（`.mp3` / `.wav` / `.flac`，封面取同名图片或内嵌封面）自动克隆成场景内的 RecordDisk，换上合成封面与音轨。
 
 ## 架构
 
@@ -26,7 +26,7 @@
 | `IronNestFCS` | **宿主 Mod** | 稳定加载、永不重载。负责首次加载 Logic、监听 F9 触发热重载、转发生命周期回调。 |
 | `IronNestFCS.Abstractions` | **契约** | 仅含 `IFcsModule` 接口。只加载一份，是唯一能安全跨 `AssemblyLoadContext` 边界传递的类型。 |
 | `IronNestFCS.Logic` | **火控逻辑** | 所有高频改动的火控代码：弹道解算、任务调度、炮塔/炮管操控、UI。被装进可回收的 ALC，按 F9 卸载并重载。 |
-| `IronNestFCS.CustomRecorder` | **独立 Mod** | 与火控无关的场景装饰，替换游戏内唱片机的音轨与贴图。 |
+| `IronNestFCS.CustomRecords` | **独立 Mod** | 与火控无关的场景装饰，扫描 `UserData/CustomRecords/` 下的音频文件，为每个文件克隆一张 RecordDisk 并替换音轨与封面。 |
 
 热重载的关键点：Logic 程序集从内存字节加载（不锁住磁盘 dll），装进 `isCollectible` 的 `AssemblyLoadContext`；重载时先 `Shutdown`（撤销 Harmony 补丁、停止协程、清空 IL2CPP 引用）再卸载旧 ALC，最后从磁盘重新加载新版本。详见 [LogicReloader.cs](IronNestFCS/LogicReloader.cs) 与 [FSC.cs](IronNestFCS.Logic/FSC.cs) 中的注释。
 
@@ -60,7 +60,7 @@ dotnet build IronNestFCS.sln -c Release
 - **宿主 Mod**（`IronNestFCS.dll`）：放入游戏的 `Mods/` 目录，由 MelonLoader 自动加载。
 - **火控逻辑**（`IronNestFCS.Logic.dll`）：输出到 `UserData/IronNestFCS/`（不放进 `Mods/`，由宿主在运行时反射加载）。
 - **契约**（`IronNestFCS.Abstractions.dll`）：放入 `UserLibs/`，确保宿主与逻辑共用同一份接口。
-- **自定义唱片机**（`IronNestFCS.CustomRecorder.dll`）：放入 `Mods/`。其素材 `a.wav`（16-bit PCM 或 32-bit float WAV）与 `diskTexture.png` 放入游戏的 `StreamingAssets/` 目录。
+- **自定义唱片机**（`IronNestFCS.CustomRecords.dll`）：放入 `Mods/`。把音频文件（`.mp3` / `.wav` / `.flac`）放入游戏的 `UserData/CustomRecords/` 目录，封面两种方式任选：① 同名图片文件（`song.mp3` 配 `song.png`/`.jpg`/`.jpeg`，音频与图片分开存放）；② 音频文件内嵌封面（TagLib 标签）。进场景后自动为每个文件克隆一张 RecordDisk；两种封面都没有的文件会被跳过。目录不存在时首次运行会自动创建，无需手工准备素材。构建时依赖（CSCore、TagLibSharp）会自动拷贝到 `UserLibs/`（不能留在 `Mods/`，否则会被 MelonLoader 误当作 Mod 加载）。
 
 > `IronNestFCS.Logic.csproj` 默认已把 `OutputPath` 指向 `$(GameDir)\UserData\IronNestFCS\`，构建即就位，改完代码进游戏按 F9 即可生效。
 
