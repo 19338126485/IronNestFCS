@@ -27,6 +27,13 @@ public class FSC
 {
     private const string HarmonyId = "com.svr2kos2.ironnestfcs.logic";
 
+    // ===== 药包自动补充 =====
+    // 两炮共用一个装药余量池：余量低于 PowderReplenishThreshold 时，每 PowderCheckInterval 秒
+    // 自动购买一次装药卡，把药包维持在充足水位，避免任务流程因装药不足卡在装填/击发阶段。
+    // 只做检测与补充，不干预 RunTaskRoutine 里的任何现有步骤。
+    private const float PowderCheckInterval = 5f;
+    private const int PowderReplenishThreshold = 6;
+
     private HarmonyInstance? _harmony;
     
     private FcsSceneInteractor _sceneInteractor;
@@ -92,6 +99,10 @@ public class FSC
                   && Turret.TryBind()
                   && TriggerConsole.TryBind();
         MelonLogger.Msg("[FCS] Initialize: " + (IsBound ? "success" : "failed"));
+        if (IsBound) {
+            // 常驻药包自动补充协程：仅保证装药余量充足，不改动任务流程。
+            _runningCoroutines.Add(MelonCoroutines.Start(ReplenishPowderLoop()));
+        }
         // _runningCoroutines.Add(MelonCoroutines.Start(ExposeAllEntities()));
         
         return IsBound;
@@ -120,6 +131,30 @@ public class FSC
         try { _harmony?.UnpatchSelf(); }
         catch (Exception ex) { MelonLogger.Error($"[FCS] UnpatchSelf failed: {ex}"); }
         _harmony = null;
+    }
+
+    /// <summary>
+    /// 常驻后台协程：周期性检测装药余量（两炮共用池），低于阈值时自动购买一次装药卡。
+    /// 购买必须持 _deskLock——采购台是共享硬件，与任务流程的采购互斥（阻塞等待，不破坏临界区）。
+    /// 必须在 TryBind 成功后启动并登记进 _runningCoroutines；Dispose 时随其它协程一起 Stop，
+    /// 迭代器被 Stop 时 Dispose 会执行 finally，锁不会泄漏。
+    /// </summary>
+    private IEnumerator ReplenishPowderLoop() {
+        while (true) {
+            yield return new WaitForSeconds(PowderCheckInterval);
+            // 两炮共用一个装药余量池，读数应一致；取较小值保守触发。
+            var charges = Math.Min(LeftGun.RemainingCharges(), RightGun.RemainingCharges());
+            if (charges >= PowderReplenishThreshold) continue;
+            MelonLogger.Msg(
+                $"[FCS] AutoReplenish: powder charges {charges} < {PowderReplenishThreshold}, buying one");
+            yield return _deskLock.Acquire();
+            try {
+                yield return _purchaseDeck.BuyPowders();
+            }
+            finally {
+                _deskLock.Release();
+            }
+        }
     }
 
     public IEnumerator ExposeAllEntities() {
