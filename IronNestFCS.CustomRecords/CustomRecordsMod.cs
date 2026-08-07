@@ -69,11 +69,16 @@ public class CustomRecordsMod : MelonMod
     }
 
     /// <summary>
-    /// 场景切换：旧克隆盘随场景卸载自动销毁，这里清空托管侧状态并重置标志，
+    /// 场景切换：销毁旧克隆盘（游戏不销毁它们，会累积），清空托管侧状态并重置标志，
     /// 使新场景中再次轮询创建。避免"done 一次置位永不重试"导致换场景后不再生成。
     /// </summary>
     public override void OnSceneWasLoaded(int buildIndex, string sceneName)
     {
+        foreach (var clone in diskClones)
+        {
+            if (clone != null)
+                Object.Destroy(clone);
+        }
         diskClones.Clear();
         playbacks.Clear();
         done = false;
@@ -85,12 +90,11 @@ public class CustomRecordsMod : MelonMod
     /// <summary>
     /// 定位可作模板的唱片对象，按优先级：
     /// 1) 精确名 "RecordDisk"（Demo 版场景）；
-    /// 2) 正式版场景中唱片对象名为 "RecordDisk 5.2_Somber" 等带编号/曲名的命名盘。
-    ///    排除我们此前克隆产生的 "(Clone)" 对象（避免链式克隆，盘越积越多）；
-    ///    优先选择"渲染器可见"（enabled && isVisible）的盘——场景中大量唱片位于
-    ///    桌子内部/地下等不可见位置，activeInHierarchy 不足以区分可见性；
-    /// 3) 场景加载初期相机尚未渲染，isVisible 暂不可靠，宽限期（VisibleWaitSeconds）内
-    ///    继续等待下一帧，避免把新盘放到隐藏位置；超时才回退到任意命名盘。
+    /// 2) 可见的桌面（Drag Surface）唱片（排除 "(Clone)"）；
+    /// 3) 可见的任意命名盘；
+    /// 4) 场景加载宽限期（VisibleWaitSeconds）内继续等待——**必须等场景稳定再创建**：
+    ///    过早创建会被 Drag Surface 系统初始化时收编（inactive + 位置重置，导致盘"消失"）；
+    /// 5) 宽限期后兜底：桌面盘优先（避免选到 Barbet/Delivery Guy 等位置的装饰竖盘）→ 任意命名盘。
     /// </summary>
     private GameObject FindRecordDiskTemplate()
     {
@@ -116,12 +120,19 @@ public class CustomRecordsMod : MelonMod
             }
         }
 
-        GameObject named = null, namedVisible = null, any = null, anyVisible = null;
+        GameObject surface = null, surfaceVisible = null, named = null, namedVisible = null, any = null;
         foreach (var item in items)
         {
             var go = item.gameObject;
             if (go.name.Contains("(Clone)"))
                 continue; // 排除此前创建的克隆盘
+            string parentName = go.transform.parent != null ? go.transform.parent.name : "";
+            if (parentName == "Drag Surface")
+            {
+                surface ??= go;
+                if (IsRenderedVisible(go))
+                    surfaceVisible ??= go;
+            }
             if (go.name.StartsWith("RecordDisk"))
             {
                 named ??= go;
@@ -131,16 +142,17 @@ public class CustomRecordsMod : MelonMod
             else
             {
                 any ??= go;
-                if (IsRenderedVisible(go))
-                    anyVisible ??= go;
             }
         }
 
+        // 可见桌面盘 → 可见命名盘 → 宽限期等待 → 桌面盘兜底 → 命名盘兜底 → 任意 RecordItem。
+        if (surfaceVisible != null)
+            return surfaceVisible;
         if (namedVisible != null)
             return namedVisible;
         if (Time.realtimeSinceStartup - sceneLoadedAt < VisibleWaitSeconds)
-            return null; // 宽限期内等相机渲染出可见性，再创建
-        return named ?? anyVisible ?? any;
+            return null; // 等场景稳定（相机渲染出可见性、Drag Surface 初始化完成），再创建
+        return surface ?? named ?? any;
     }
 
     /// <summary>对象自身或子物体存在"启用且可见"的 MeshRenderer。</summary>
