@@ -416,9 +416,7 @@ public class CustomRecordsMod : MelonMod
     {
         try
         {
-            var prop = recordItem.GetType().GetProperty("displayName");
-            if (prop != null && prop.PropertyType == typeof(string) && prop.CanWrite)
-                prop.SetValue(recordItem, title);
+            recordItem.gameObject.name = title;
         }
         catch
         {
