@@ -30,6 +30,12 @@ public enum BulletType {
     WP = 20,
 }
 
+public static class BulletTypeExtensions {
+    /// <summary>弹种显示名：采购卡片/玩家习惯叫 PCLM，枚举与弹舱 ShellId 叫 PLCM。</summary>
+    public static string DisplayName(this BulletType type) =>
+        type == BulletType.PLCM ? "PCLM" : type.ToString();
+}
+
 public class GunSystem {
     private string _surfix = "";
 
