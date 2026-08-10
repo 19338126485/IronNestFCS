@@ -26,6 +26,7 @@
 .vs/
 [Bb]in/
 [Oo]bj/
+/Release/
 _UpgradeReport_Files/
 [Pp]ackages/
 
