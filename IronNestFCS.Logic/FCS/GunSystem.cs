@@ -20,7 +20,7 @@ public enum BulletType {
     HE = 10,
     INCN = 11,
     LE = 12,
-    PLCM = 13,
+    PCLM = 13,
     PHGN = 14,
     PRPG = 15,
     SMK = 16,
@@ -109,7 +109,7 @@ public class GunSystem {
     }
     
     public string? BulletInChamber() {
-        return gunController?.ChamberedShellBlueprint?.shellDefinition?.ShellId;
+        return gunController?.ChamberedShellBlueprint?.shellDefinition?.ShellId.Replace("PLCM", "PCLM");
     }
     
     public bool IsChamberEmpty() {
@@ -120,7 +120,7 @@ public class GunSystem {
         bullets.Clear();
         if (shellSelector == null) return;
         foreach (var shell in shellSelector.bullets) {
-            bullets.Add(shell?.GetComponent<ShellBlueprint>()?.shellDefinition?.ShellId);
+            bullets.Add(shell?.GetComponent<ShellBlueprint>()?.shellDefinition?.ShellId.Replace("PLCM", "PCLM"));
         }
         MelonLogger.Msg($"[FCS] GunSystem {_surfix}: Cylinder bullets: {string.Join(", ", bullets)}");
     }

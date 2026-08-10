@@ -18,7 +18,9 @@ public class PurchaseDeck {
         foreach (var card in cards) {
             MelonLogger.Msg($"[FCS] PurchaseDeck: Found card {card.CurrentDefinition.ID}");
             if (TryParse(
-                    card.CurrentDefinition.ID.Replace("SMOKE", "SMK").Replace("Shell", ""),
+                    card.CurrentDefinition.ID
+                        .Replace("SMOKE", "SMK")
+                        .Replace("Shell", ""),
                     out BulletType type
                 )) {
                 bulletCards[type] = card.transform;
