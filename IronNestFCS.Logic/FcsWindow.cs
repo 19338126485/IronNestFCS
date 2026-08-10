@@ -1,4 +1,3 @@
-using IronNestFCS.Logic.FCS;
 using MelonLoader;
 using UnityEngine;
 
@@ -61,7 +60,7 @@ public class FcsWindow
         GUI.Label(new Rect(x, y, w, h), "Left Gun:");
         y += h + gap;
         if (fcs.LeftTask != null) {
-            GUI.Label(new Rect(x, y, w, h), $"  T{fcs.LeftTask.targetId} {fcs.LeftTask.bulletType.DisplayName()} {fcs.LeftTask.progress}");
+            GUI.Label(new Rect(x, y, w, h), $"  T{fcs.LeftTask.targetId} {fcs.LeftTask.bulletType.ToString()} {fcs.LeftTask.progress}");
             y += h + gap;
             GUI.Label(new Rect(x, y, w, h), $"  Target: {fcs.LeftTask.angel:F1}°, {fcs.LeftTask.distance:F2}km");
             y += h + gap;
@@ -73,7 +72,7 @@ public class FcsWindow
         GUI.Label(new Rect(x, y, w, h), "Right Gun:");
         y += h + gap;
         if (fcs.RightTask != null) {
-            GUI.Label(new Rect(x, y, w, h), $"  T{fcs.RightTask.targetId} {fcs.RightTask.bulletType.DisplayName()} {fcs.RightTask.progress}");
+            GUI.Label(new Rect(x, y, w, h), $"  T{fcs.RightTask.targetId} {fcs.RightTask.bulletType.ToString()} {fcs.RightTask.progress}");
             y += h + gap;
             GUI.Label(new Rect(x, y, w, h), $"  Target: {fcs.RightTask.angel:F1}°, {fcs.RightTask.distance:F2}km");
             y += h + gap;
@@ -87,7 +86,7 @@ public class FcsWindow
         y += h + gap;
         foreach (var item in fcs.QueueCan)
         {
-            GUI.Label(new Rect(x, y, w, h), $"  target{item.targetId} { ConvertPosition(item.position)} {item.angel,5:F1}°/{item.distance,5:F2}km {item.bulletType.DisplayName()} ");
+            GUI.Label(new Rect(x, y, w, h), $"  target{item.targetId} { ConvertPosition(item.position)} {item.angel,5:F1}°/{item.distance,5:F2}km {item.bulletType.ToString()} ");
             y += h + gap;
         }
 
