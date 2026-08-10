@@ -31,6 +31,8 @@ public enum BulletType {
 }
 
 public class GunSystem {
+    private const float MinimumPostShotRecoverySeconds = 13f;
+
     private string _surfix = "";
 
     private CylinderShellSelector? shellSelector;
@@ -41,6 +43,7 @@ public class GunSystem {
     private List<LookAtTarget> powderButtons = new();
     private LookAtTarget? loadPowderButton;
     private GunController? gunController;
+    private ArtilleryReloadController? reloadController;
     private LinearSliderInteractable? elevationLever;
     private OdometerDisplay? remainingCharges;
 
@@ -86,6 +89,7 @@ public class GunSystem {
 
         loadPowderButton = reloadingConsole.FindChild("Universal Button Charge Rammer (1)").GetComponent<LookAtTarget>();
         gunController = GameObject.Find("Gun"+surfix).GetComponent<GunController>();
+        reloadController = gunController?.artilleryReloadController;
         elevationLever = GameObject.Find(".Elevation Lever Baseplate")?.transform.FindChild(".Elevation Lever " + surfix)
             .GetComponent<LinearSliderInteractable>();
         return true;
@@ -132,6 +136,22 @@ public class GunSystem {
         MelonLogger.Msg("[GunSystem] NextBullet");
         nextBulletButton!.OnClickDown();
     }
+
+    /// <summary>
+    /// 正式版的装填状态索引是数据驱动的，空闲时可能处于不同的 CurrentStateIndex，
+    /// 因此不把某个固定索引当作“可装填”。只依据控制器实际的 working、炮闩锁定和炮管运动状态判断。
+    /// </summary>
+    private IEnumerator WaitForReloadReady() {
+        while (gunController != null) {
+            var mechanismReady = reloadController == null || !reloadController.working;
+            var breechReady = !gunController.ExternalReloadLoweringLocked;
+            var motionReady = gunController.elevationChangeVelocity == 0;
+            if (mechanismReady && breechReady && motionReady)
+                yield break;
+
+            yield return new WaitForSeconds(0.1f);
+        }
+    }
     
     /// <summary>
     /// 装填指定弹种：先把弹仓转到目标弹，再按装填。转弹仓每步之间要等 1 秒
@@ -139,6 +159,10 @@ public class GunSystem {
     /// 必须走协程而非 async：continuation 要留在主线程才能安全访问 IL2CPP 对象。
     /// </summary>
     public IEnumerator LoadBullet(BulletType type) {
+        // 上一发的退壳/炮闩/复位机构可能仍在工作。先等待真实机构状态空闲，
+        // 再开始下一轮弹仓和推弹操作，避免连续射击时过早点击后续控件。
+        yield return WaitForReloadReady();
+
         RefreshBullets();
         var index = bullets.IndexOf(type.ToString());
         if (index == -1) {
@@ -160,6 +184,8 @@ public class GunSystem {
                               $"current: {string.Join(", ", bullets)}");
             yield break;
         }
+
+        yield return WaitForReloadReady();
         yield return FcsSceneInteractor.WaitAndClick(loadBulletButton!);
     }
 
@@ -185,10 +211,19 @@ public class GunSystem {
     }
 
     public IEnumerator WaitBackToIdle() {
-        while (gunController != null && gunController.elevationChangeVelocity != 0) {
+        // 保留原来的 13 秒最小恢复窗口，但同时要求正式版装填机构真正结束工作。
+        // 这样下一任务不会只因为炮管停止运动就过早进入装填。
+        var minimumRecoveryUntil = Time.realtimeSinceStartup + MinimumPostShotRecoverySeconds;
+        while (gunController != null) {
+            var minimumDelayDone = Time.realtimeSinceStartup >= minimumRecoveryUntil;
+            var mechanismReady = reloadController == null || !reloadController.working;
+            var breechReady = !gunController.ExternalReloadLoweringLocked;
+            var motionReady = gunController.elevationChangeVelocity == 0;
+            if (minimumDelayDone && mechanismReady && breechReady && motionReady)
+                yield break;
+
             yield return new WaitForSeconds(0.1f);
         }
-        yield return new WaitForSeconds(13);
     }
 
     public IEnumerator WaitFire() {
