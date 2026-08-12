@@ -18,7 +18,7 @@ public class FcsWindow
     private readonly FSC fcs;
 
     private bool showWindow = true;
-    private Rect defaultWindowRect = new(40, 40, 260, 170);
+    private Rect defaultWindowRect = new(40, 40, 380, 170);
 
     public FcsWindow(FSC fcs)
     {
@@ -39,6 +39,7 @@ public class FcsWindow
             windowRect.height += 28f;
         }
         windowRect.height += fcs.QueueCan.Count * 28f;
+        windowRect.height += fcs.Intel.WindowLines.Count * 28f;
 
         // 背景框
         GUI.Box(windowRect, "IronNest FCS");
@@ -87,6 +88,13 @@ public class FcsWindow
         foreach (var item in fcs.QueueCan)
         {
             GUI.Label(new Rect(x, y, w, h), $"  target{item.targetId} { ConvertPosition(item.position)} {item.angel,5:F1}°/{item.distance,5:F2}km {item.bulletType.ToString()} ");
+            y += h + gap;
+        }
+
+        // 测绘/情报状态（只读展示；交互走场景里的 3D 按钮，鼠标锁定点不到这里）
+        foreach (var line in fcs.Intel.WindowLines)
+        {
+            GUI.Label(new Rect(x, y, w, h), line);
             y += h + gap;
         }
 

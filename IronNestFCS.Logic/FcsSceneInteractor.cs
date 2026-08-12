@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using Il2Cpp;
 using Il2CppTMPro;
 using IronNestFCS.Logic.FCS;
@@ -129,6 +129,34 @@ public class FcsSceneInteractor {
             x -= 0.05f;
             y -= 0.0045f;
         }
+
+        //////////////// 情报/测绘按钮（第二阶段功能）
+        // Survey：手动强制解析情报；Auto：情报自动刷新开关（默认开）
+        // Next/Place/Del：候选轮转 / 落子 / 忽略；Reveal：作弊点亮全图
+        // 鼠标锁定在屏幕中心，一切交互走 3D 按钮（准星射线点击），不用 IMGUI 按钮。
+        AddRowButton("Survey", Color.cyan, _ => fcs.Intel.Survey());
+        AddRowButton("Auto", fcs.Intel.AutoRefresh ? Color.green : Color.white, btn => {
+            var on = fcs.Intel.ToggleAutoRefresh();
+            SetColor(btn, on ? Color.green : Color.white);
+        });
+        AddRowButton("Next", Color.yellow, _ => fcs.Intel.CycleCandidate());
+        AddRowButton("Place", Color.green, _ => fcs.Intel.PlaceCurrentCandidate());
+        AddRowButton("Del", Color.red, _ => fcs.Intel.DismissCurrent());
+        AddRowButton("Reveal", Color.magenta, _ => fcs.Intel.RevealAll());
+
+        // 在本排按钮末尾追加一个按钮的局部辅助函数（沿用本方法的排版步进）。
+        void AddRowButton(string label, Color color, Action<GameObject> onClick) {
+            GameObject btn = null!;
+            btn = AddButton(() => onClick(btn), color);
+            btn.transform.position = new Vector3(x, y, z);
+            btn.transform.localScale = Vector3.one * 0.02f;
+            var label2 = AddText(label, 14f);
+            label2.transform.SetParent(btn.transform, false);
+            label2.transform.localPosition = new Vector3(-1.9f, 0, -10.6f);
+            label2.transform.localScale = Vector3.one * 1.0f;
+            x -= 0.05f;
+            y -= 0.0045f;
+        }
     }
 
     /// <summary>任务完成回调</summary>
@@ -138,6 +166,9 @@ public class FcsSceneInteractor {
     public void Update() {
         clicks.Update();
     }
+
+    /// <summary>登记一个热重载时需要销毁的场景物体（标记环等由 IntelSystem 创建的可视物）。</summary>
+    public void TrackForShutdown(GameObject go) => destroyOnShutdown.Add(go);
 
     public void ShutDown() {
         clicks.Clear();
@@ -156,9 +187,42 @@ public class FcsSceneInteractor {
         var button = GameObject.CreatePrimitive(PrimitiveType.Cube);
         destroyOnShutdown.Add(button);
         var collider = button.GetComponent<Collider>();
-        clicks.Register(collider, onClick);
+        clicks.Register(collider, () => {
+            // 点击特效：颜色瞬闪 + 缩放回弹。协程经 FSC 登记，热重载时统一停止。
+            fcs.RunTracked(ClickFeedback(button));
+            onClick();
+        });
         SetColor(button, color);
         return button;
+    }
+
+    /// <summary>
+    /// 按钮点击特效：闪白 + 缩放先缩后弹回。
+    /// 颜色与缩放在点击瞬间现场读取、结束原样恢复，因此与 T 按钮自身的变色逻辑不冲突。
+    /// </summary>
+    private static IEnumerator ClickFeedback(GameObject btn) {
+        if (btn == null) yield break;
+        var originalScale = btn.transform.localScale;
+        var renderer = btn.GetComponent<Renderer>();
+        var mat = renderer != null ? renderer.material : null;
+        var originalColor = mat == null ? Color.white : mat.color;
+
+        if (mat != null) {
+            var flash = Color.Lerp(originalColor, Color.white, 0.75f);
+            mat.color = flash;
+            if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", flash);
+        }
+        btn.transform.localScale = originalScale * 0.7f;
+        yield return new WaitForSeconds(0.1f);
+        if (btn == null) yield break;
+        btn.transform.localScale = originalScale * 1.15f;
+        yield return new WaitForSeconds(0.08f);
+        if (btn == null) yield break;
+        btn.transform.localScale = originalScale;
+        if (mat != null) {
+            mat.color = originalColor;
+            if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", originalColor);
+        }
     }
 
     /// <summary>

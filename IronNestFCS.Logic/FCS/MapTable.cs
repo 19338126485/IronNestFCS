@@ -1,4 +1,4 @@
-﻿using Il2Cpp;
+using Il2Cpp;
 using MelonLoader;
 using UnityEngine;
 
@@ -67,6 +67,17 @@ public class MapTable {
             position = artilleries[index].localPosition * 3.8164f + new Vector3(10.016f, 5.235f, 0f)
         };
         return task;
+    }
+
+    /// <summary>玩家炮位的网格坐标（km）。情报解算里"从炮位出发"类锚点用。</summary>
+    public Vector3? TurretGridPos() {
+        if (turret == null) return null;
+        return turret.localPosition * 3.8164f + new Vector3(10.016f, 5.235f, 0f);
+    }
+
+    /// <summary>玩家炮塔棋子在 Draggable Surface 下的局部坐标（原始值，供网格偏移校准）。</summary>
+    public Vector3? TurretLocalPos() {
+        return turret == null ? null : turret.localPosition;
     }
 
     public List<EntityLocation> GetAllFireMissionEntities() {
