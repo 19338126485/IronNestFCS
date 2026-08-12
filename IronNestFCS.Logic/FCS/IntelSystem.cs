@@ -532,6 +532,50 @@ public class IntelSystem {
         RebuildWindowLines();
     }
 
+    /// <summary>
+    /// 直接对当前候选开火（Fire）：不经过棋子——用仿射把网格坐标换成桌面局部坐标，
+    /// 再走与 MapTable.GetMarkTarget（T 按钮）完全相同的相对测量公式生成射击诸元入队。
+    /// 与"放棋子再按 T"数学等价，但不受棋子编号 1~4 的限制，目标数无上限。
+    /// 入队后自动切到下一个待处理候选，可连续点名。
+    /// </summary>
+    public void FireCurrentCandidate() {
+        if (Candidates.Count == 0 || CurrentIndex >= activeEntries.Count) {
+            MelonLogger.Msg("[Intel] 没有可开火的候选");
+            return;
+        }
+        if (!affineReady) {
+            MelonLogger.Error("[Intel] 仿射校准不可用，无法生成射击诸元（先按 Survey）");
+            return;
+        }
+        var surface = GameObject.Find("Draggable Surface")?.transform;
+        var turretLocal = fcs?.MapTable.TurretLocalPos();
+        if (surface == null || turretLocal == null || fcs == null) {
+            MelonLogger.Error("[Intel] 开火失败：地图或炮塔未绑定（FCS 未就绪？）");
+            return;
+        }
+        var e = activeEntries[CurrentIndex];
+        // 与 GetMarkTarget 相同的公式：局部坐标差 → 距离×3.8164 / 方向角 SignedAngle
+        var targetLocal = surface.InverseTransformPoint(AffineForward(e.Cand.Point));
+        var delta = targetLocal - turretLocal.Value;
+        var dist = delta.magnitude * 3.8164f;
+        var angle = Vector3.SignedAngle(delta, Vector3.up, Vector3.forward);
+        if (angle < 0) angle += 360;
+        var task = new ArtilleryTask {
+            targetId = e.Seq,
+            angel = angle,
+            distance = dist,
+            position = new Vector3(e.Cand.Point.x, e.Cand.Point.y, 0f),
+            bulletType = fcs.Interactor.selectedBulletType,
+        };
+        MelonLogger.Msg($"[Intel] 直接开火 #{e.Seq}: [{e.Cand.Name}] {angle:F1}°/{dist:F2}km {task.bulletType}");
+        fcs.EnqueueTask(task);
+        // 自动切到下一个待处理候选，便于连续点名
+        if (Candidates.Count > 1) {
+            CurrentIndex = (CurrentIndex + 1) % Candidates.Count;
+            RebuildWindowLines();
+        }
+    }
+
     /// <summary>手动落子跟随：玩家把棋子拖到某待处理候选 0.4km 内 → 自动标记已落子。</summary>
     private void DetectManualPlacements() {
         if (!affineReady || activeEntries.Count == 0) return;

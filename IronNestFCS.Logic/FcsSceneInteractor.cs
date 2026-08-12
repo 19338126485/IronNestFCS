@@ -133,6 +133,7 @@ public class FcsSceneInteractor {
         //////////////// 情报/测绘按钮（第二阶段功能）
         // Survey：手动强制解析情报；Auto：情报自动刷新开关（默认开）
         // Next/Place/Del：候选轮转 / 落子 / 忽略；Reveal：作弊点亮全图
+        // Fire：不放棋子直接对当前候选开火（仿射换算桌面坐标，与 T 按钮同公式，不受编号 1~4 限制）
         // 鼠标锁定在屏幕中心，一切交互走 3D 按钮（准星射线点击），不用 IMGUI 按钮。
         AddRowButton("Survey", Color.cyan, _ => fcs.Intel.Survey());
         AddRowButton("Auto", fcs.Intel.AutoRefresh ? Color.green : Color.white, btn => {
@@ -141,6 +142,7 @@ public class FcsSceneInteractor {
         });
         AddRowButton("Next", Color.yellow, _ => fcs.Intel.CycleCandidate());
         AddRowButton("Place", Color.green, _ => fcs.Intel.PlaceCurrentCandidate());
+        AddRowButton("Fire", new Color(1f, 0.5f, 0f), _ => fcs.Intel.FireCurrentCandidate());
         AddRowButton("Del", Color.red, _ => fcs.Intel.DismissCurrent());
         AddRowButton("Reveal", Color.magenta, _ => fcs.Intel.RevealAll());
 
