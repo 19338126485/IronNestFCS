@@ -378,8 +378,25 @@ public class IntelSystem {
             }
         }
 
+        // 前线观测员（Spotter 卡）报告预分组：按敌军名收集距离圆（圆心=FO 报点，行内自带，
+        // 无锚点引用，不参与分支组合）。与同名主题合并解算，剩余的由阶段 2.6 独立解算。
+        var foGroups = new Dictionary<string, List<IGeoConstraint>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in doc.Items) {
+            if (item.Kind != "foDist") continue;
+            if (!foGroups.TryGetValue(item.AnchorText, out var foList)) {
+                foGroups[item.AnchorText] = foList = new List<IGeoConstraint>();
+            }
+            foList.Add(new DistanceCircle {
+                Center = new Vector2(item.Value2, item.Value3), RadiusKm = item.Value1,
+                AnchorName = "FO报点",
+            });
+        }
+
         // 阶段 2：主题（有序，链式锚点，多解分支传播）
         foreach (var subject in doc.Subjects) {
+            // 同名敌军的 FO 距离圆并入本主题一起解
+            var foExtra = foGroups.Remove(subject.Name, out var fel) ? fel : null;
+
             // 按"不同锚点名"收集各锚点的分支选项（同一锚点被多条约束引用时分支必须一致）
             var items = new List<ParsedItem>();
             var anchorNames = new List<string>();
@@ -396,8 +413,8 @@ public class IntelSystem {
                     anchorNames.Add(item.AnchorText);
                 }
             }
-            if (items.Count < 2) {
-                if (verbose && items.Count == 1)
+            if (items.Count + (foExtra?.Count ?? 0) < 2) {
+                if (verbose && items.Count + (foExtra?.Count ?? 0) == 1)
                     MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 约束不足（1 条），无法定位");
                 continue;
             }
@@ -429,6 +446,7 @@ public class IntelSystem {
                         ? new BearingLine { Origin = p, BearingDeg = item.Value1, AnchorName = name }
                         : new DistanceCircle { Center = p, RadiusKm = item.Value1, AnchorName = name });
                 }
+                if (foExtra != null) constraints.AddRange(foExtra); // FO 圆无锚点，每个分支组合都一样
                 if (verbose) {
                     foreach (var c in constraints) MelonLogger.Msg($"[Intel] 约束[{subject.Name}]: {c.Describe()}");
                 }
@@ -507,6 +525,44 @@ public class IntelSystem {
                 }
             }
             RegisterAnchorOptions(subject.Name, emitted);
+        }
+
+        // 阶段 2.6：前线观测员（Spotter 卡）报告独立解算——没有同名主题可并入的敌军组。
+        // 每个 FO 报一条"最近敌军"距离圆；单个 FO 无法定位，两个起有双解（照常列出 alt 人工裁决），
+        // 三个起通常唯一。同一名称的重复报告会被几何去重天然吸收。
+        foreach (var (foName, cons) in foGroups) {
+            if (cons.Count < 2) {
+                if (verbose) MelonLogger.Msg($"[Intel] FO 报告[{foName}]: 仅 1 条，无法定位（需多个观测员交叉）");
+                continue;
+            }
+            var solved = GeoSolver.Solve(cons);
+            solved.RemoveAll(c => !IsOnMap(c.Point));
+            if (solved.Count == 0) {
+                if (verbose) MelonLogger.Msg($"[Intel] FO 报告[{foName}]: 交点均在图外");
+                continue;
+            }
+            var best = solved[0];
+            best.Name = foName;
+            results.Add(best);
+            var emitted = new List<Vector2> { best.Point };
+            var altCount = 0;
+            for (var i = 1; i < solved.Count; ++i) {
+                if (solved[i].Score - best.Score >= GeoSolver.AmbiguityThresholdKm) break;
+                if (altCount >= 3) break;
+                var alt = solved[i];
+                alt.Name = foName + (altCount == 0 ? "(alt)" : $"(alt{altCount + 1})");
+                results.Add(alt);
+                emitted.Add(alt.Point);
+                altCount++;
+                if (verbose) {
+                    MelonLogger.Msg($"[Intel] FO 报告[{foName}] 存在多解歧义: " +
+                                    $"备选 ({alt.Point.x:F2},{alt.Point.y:F2}) score={alt.Score:F3}");
+                }
+            }
+            RegisterAnchorOptions(foName, emitted); // 与主题同等待遇：后续报文可以它为锚点
+            if (verbose) {
+                foreach (var c in cons) MelonLogger.Msg($"[Intel] 约束[{foName}]: {c.Describe()}");
+            }
         }
 
         // 阶段 2.5：后勤车队（位置报告卡）报文 → 铁巢新位置解算。

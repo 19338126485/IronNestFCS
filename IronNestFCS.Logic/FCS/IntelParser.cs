@@ -82,6 +82,12 @@ public static class IntelParser {
     private static readonly Regex ConvoyDistance =
         new(@"相距\s*(?<dist>[\d.]+)\s*(?:km|公里|千米).*?(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
             RegexOptions.Compiled);
+    // "FO[#n] 音频报告 敌方观测员#10: 1.92km 自 F5 3:0 . . ."
+    // 前线观测员（Spotter 卡）报告离自己最近的敌军：敌军的距离圆约束（圆心=FO 所在报点）。
+    private static readonly Regex FoReport =
+        new(@"^FO.*报告\s*(?<name>.+?)\s*[:：]\s*(?<dist>[\d.]+)\s*(?<unit>km|公里|千米|米)\b\s*自\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
+            RegexOptions.Compiled);
+
     // "车队#3发现铁巢: <风味文本> 180 自 H4 2:7 . . ." —— 方位线约束（起点=报点，结构为"<度> 自 <格>"）
     private static readonly Regex ConvoyBearing =
         new(@"(?<deg>\d{1,3})\s*自\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
@@ -201,6 +207,17 @@ public static class IntelParser {
                 doc.Items.Add(new ParsedItem {
                     RawLine = line, Kind = "turretDist",
                     Value1 = ParseFloat(m.Groups["dist"].Value), Value2 = gx, Value3 = gy,
+                });
+                continue;
+            }
+            // "FO[#n] 音频报告 敌方观测员#10: 1.92km 自 F5 3:0"：前线观测员卡，敌军的距离圆约束
+            m = FoReport.Match(line);
+            if (m.Success) {
+                var (gx, gy) = ParseBareGrid(m, "");
+                doc.Items.Add(new ParsedItem {
+                    RawLine = line, Kind = "foDist", AnchorText = m.Groups["name"].Value.Trim(),
+                    Value1 = ToKm(m), Value2 = gx, Value3 = gy,
+                    TokenName = GuessToken(line),
                 });
                 continue;
             }
