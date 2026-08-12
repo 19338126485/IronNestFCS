@@ -378,18 +378,26 @@ public class IntelSystem {
             }
         }
 
-        // 前线观测员（Spotter 卡）报告预分组：按敌军名收集距离圆（圆心=FO 报点，行内自带，
-        // 无锚点引用，不参与分支组合）。与同名主题合并解算，剩余的由阶段 2.6 独立解算。
+        // 前线观测员（Spotter 卡）报告预分组：按敌军名收集距离圆/方位线（锚点=FO 报点，
+        // 行内自带，无锚点引用，不参与分支组合）。与同名主题合并解算，剩余的由阶段 2.6 独立解算。
         var foGroups = new Dictionary<string, List<IGeoConstraint>>(StringComparer.OrdinalIgnoreCase);
         foreach (var item in doc.Items) {
-            if (item.Kind != "foDist") continue;
+            IGeoConstraint? c = item.Kind switch {
+                "foDist" => new DistanceCircle {
+                    Center = new Vector2(item.Value2, item.Value3), RadiusKm = item.Value1,
+                    AnchorName = "FO报点",
+                },
+                "foBearing" => new BearingLine {
+                    Origin = new Vector2(item.Value2, item.Value3), BearingDeg = item.Value1,
+                    AnchorName = "FO报点",
+                },
+                _ => null,
+            };
+            if (c == null) continue;
             if (!foGroups.TryGetValue(item.AnchorText, out var foList)) {
                 foGroups[item.AnchorText] = foList = new List<IGeoConstraint>();
             }
-            foList.Add(new DistanceCircle {
-                Center = new Vector2(item.Value2, item.Value3), RadiusKm = item.Value1,
-                AnchorName = "FO报点",
-            });
+            foList.Add(c);
         }
 
         // 阶段 2：主题（有序，链式锚点，多解分支传播）

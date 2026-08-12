@@ -88,6 +88,13 @@ public static class IntelParser {
         new(@"^FO.*报告\s*(?<name>.+?)\s*[:：]\s*(?<dist>[\d.]+)\s*(?<unit>km|公里|千米|米)\b\s*自\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
             RegexOptions.Compiled);
 
+    // "FO[#n]发现 敌方观测员#9: 313 自 G1 9:4" / "FO发现 幽灵炮台: 049 自 A1 0:2"
+    // 前线观测员的方位线报告：<度> 自 <FO 报点>，罗盘约定（实测：313° 自 (6.9,0.4) → 敌军真位 (3.86,3.33)）。
+    // 必须先于 ConvoyBearing 匹配——结构同为"<度> 自 <格>"，不拦截会被误吞成铁巢约束。
+    private static readonly Regex FoBearing =
+        new(@"^FO.*?发现\s*(?<name>.+?)\s*[:：]\s*(?<deg>\d{1,3})\s*自\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
+            RegexOptions.Compiled);
+
     // "车队#3发现铁巢: <风味文本> 180 自 H4 2:7 . . ." —— 方位线约束（起点=报点，结构为"<度> 自 <格>"）
     private static readonly Regex ConvoyBearing =
         new(@"(?<deg>\d{1,3})\s*自\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
@@ -105,6 +112,7 @@ public static class IntelParser {
         ("参考点", "MapToken_RefrencePoint"), ("路径点", "MapToken_RefrencePoint"),
         ("waypoint", "MapToken_RefrencePoint"), ("reference", "MapToken_RefrencePoint"),
         ("炮兵", "MapToken_Artillery"), ("artiller", "MapToken_Artillery"),
+        ("炮台", "MapToken_Artillery"), ("battery", "MapToken_Artillery"),
         ("指挥", "MapToken_Artillery"), ("fdc", "MapToken_Artillery"),
         ("坦克", "MapToken_Artillery"), ("tank", "MapToken_Artillery"),
         ("步兵", "MapToken_Artillery"), ("infantry", "MapToken_Artillery"),
@@ -217,6 +225,18 @@ public static class IntelParser {
                 doc.Items.Add(new ParsedItem {
                     RawLine = line, Kind = "foDist", AnchorText = m.Groups["name"].Value.Trim(),
                     Value1 = ToKm(m), Value2 = gx, Value3 = gy,
+                    TokenName = GuessToken(line),
+                });
+                continue;
+            }
+            // "FO#2发现 敌方观测员#9: 313 自 G1 9:4"：前线观测员的方位线报告（敌军的方位线约束）。
+            // 必须先于 ConvoyBearing 匹配，否则会被误吞成铁巢约束
+            m = FoBearing.Match(line);
+            if (m.Success) {
+                var (gx, gy) = ParseBareGrid(m, "");
+                doc.Items.Add(new ParsedItem {
+                    RawLine = line, Kind = "foBearing", AnchorText = m.Groups["name"].Value.Trim(),
+                    Value1 = ParseFloat(m.Groups["deg"].Value), Value2 = gx, Value3 = gy,
                     TokenName = GuessToken(line),
                 });
                 continue;
