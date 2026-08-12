@@ -158,6 +158,11 @@ public class ConvoyAssist {
 
     // ================= 自动后勤车队（位置报告卡） =================
 
+    /// <summary>IntelSystem 通报新一轮转移：重置"失败不再重试"记录（新一轮允许重新打卡）。</summary>
+    public void OnRelocationEpoch() {
+        exhaustedCell = null;
+    }
+
     /// <summary>IntelSystem 在转移未定位且大格已知时调用。已在跑则忽略（重入安全）。</summary>
     public void RequestConvoyIntel(string cell) {
         if (fcs == null || intel == null || convoyRunning) return;

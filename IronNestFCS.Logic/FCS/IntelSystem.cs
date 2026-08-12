@@ -81,16 +81,18 @@ public class IntelSystem {
     private IntPtr lastMissionPtr;
 
     // 紧急转移：ConvoyAssist 检测到炮位移动后置位。期间纸带上的旧"铁巢"网格行、
-    // 旧大格公告与旧车队报告全都不可信（纸带按时间累积，陈旧情报隔离见 BuildCandidateResults 阶段 2.5）。
+    // 旧车队报告全都不可信（新旧分界机制见 BuildCandidateResults 阶段 2.5）。
     private bool turretRelocationPending;
     /// <summary>转移状态对外只读（ConvoyAssist 的自动车队循环据此判断是否继续打卡）。</summary>
     public bool TurretRelocationPending => turretRelocationPending;
-    /// <summary>检测到转移那一刻纸带上的大格公告（上一轮残留）。与它相同的公告 = 旧公告，新公告未到。</summary>
-    private string? zoneCellAtDetect;
     /// <summary>车队情报已解出本轮新炮位（转移期间唯一可信的锚点来源）。</summary>
     private bool turretAnchorFromConvoy;
-    /// <summary>最近一次解析到的"铁巢新位置位于X某处"大格公告（自动车队卡参数）。</summary>
+    /// <summary>纸带上最新的大格公告（自动车队卡参数来源，每次 Survey 重读）。</summary>
     private string? lastTurretZoneCell;
+    /// <summary>出现过的车队报告行（原文去重）：区分新旧情报的唯一可靠依据。</summary>
+    private readonly HashSet<string> seenConvoyLines = new();
+    /// <summary>本轮转移累积的车队约束（每次转移清空，跨 Survey 累积）。</summary>
+    private readonly List<IGeoConstraint> pendingConvoyCons = new();
 
     // 标记物资源（实例字段，ShutDown 清空；静态会钉住旧 ALC）
     private Mesh? ringMesh;
@@ -176,20 +178,21 @@ public class IntelSystem {
         WindowLines.Clear();
         turretRelocationPending = false;
         lastTurretZoneCell = null;
-        zoneCellAtDetect = null;
         turretAnchorFromConvoy = false;
+        seenConvoyLines.Clear();
+        pendingConvoyCons.Clear();
     }
 
     /// <summary>
-    /// ConvoyAssist 通报：铁巢已紧急转移。记下纸带上当前的大格公告（用于区分新旧公告），
-    /// 并立即重解析——此后在新大格公告出现前，TryGetTurretGrid 拒绝一切纸带炮位来源。
+    /// ConvoyAssist 通报：铁巢已紧急转移。清空本轮车队约束累积并立即重解析——
+    /// 此后在新一轮车队报告出现前，TryGetTurretGrid 拒绝一切纸带炮位来源。
     /// </summary>
     public void OnTurretRelocated() {
-        zoneCellAtDetect = lastTurretZoneCell; // 上一轮的公告（可能为 null=本任务首次转移）
-        lastTurretZoneCell = null;
+        pendingConvoyCons.Clear();
         turretAnchorFromConvoy = false;
         turretRelocationPending = true;
-        MelonLogger.Msg("[Intel] 铁巢已转移：旧炮位锚点作废，等待新大格公告与车队情报");
+        fcs?.Convoy.OnRelocationEpoch(); // 新一轮：重置车队卡的"失败不再重试"记录
+        MelonLogger.Msg("[Intel] 铁巢已转移：旧炮位锚点作废，等待车队新报告（纸带最新大格将用作车队卡参数）");
         Survey(full: false);
     }
 
@@ -583,53 +586,39 @@ public class IntelSystem {
         // 每条报告是对铁巢的一条几何约束（距离圆/方位线，锚点坐标行内自带）；
         // 唯一解才接受（双解歧义时等更多报告，由 AutoConvoy 继续打卡）。
         //
-        // 陈旧情报隔离（2026-08-13 实测教训：二次转移时旧报告秒解出旧位置并错误"确认"）：
-        // 纸带按时间累积，上一轮的"位于X某处"公告与车队报告全都还在纸上。因此——
-        //  1) 大格公告与检测到转移时相同（或没来过公告）→ 本轮转移的新公告未打印，
-        //     全部车队报告视为上一轮的陈旧情报，一律忽略，也不更新车队卡参数；
-        //  2) 新大格公告出现 → 只采纳"最后一条公告之后"的报告（此前的是上一轮的）。
-        string? zoneCell = null;
-        var lastZoneItemIdx = -1;
-        for (var i = 0; i < doc.Items.Count; ++i) {
-            if (doc.Items[i].Kind == "turretZone") {
-                zoneCell = doc.Items[i].AnchorText;
-                lastZoneItemIdx = i;
+        // 新旧情报分界（2026-08-13 两次实测教训）：
+        //  - 纸带是【倒序】的（新行在上），靠行位置区分新旧不可行；
+        //  - 同一任务可能多次转移到【同一大格】（公告文本不变），靠公告变化区分也不可行；
+        //  - 唯一可靠的分界是"这一行以前见过没有"：seenConvoyLines 登记所有出现过的
+        //    报告行，转移待定期间只把首次出现的行累积进本轮约束（pendingConvoyCons，
+        //    每次转移清空）。上一轮的报告行早已被登记，自然被排除。
+        var turretCons = pendingConvoyCons; // 本轮转移的累积约束（跨 Survey 保留）
+        var fresh = 0;
+        foreach (var item in doc.Items) {
+            if (item.Kind == "turretZone") {
+                lastTurretZoneCell = item.AnchorText; // 纸带上最新的大格公告 = 车队卡参数
+                continue;
+            }
+            IGeoConstraint? c = item.Kind switch {
+                "turretDist" => new DistanceCircle {
+                    Center = new Vector2(item.Value2, item.Value3), RadiusKm = item.Value1,
+                    AnchorName = "车队报点",
+                },
+                "turretBearing" => new BearingLine {
+                    Origin = new Vector2(item.Value2, item.Value3), BearingDeg = item.Value1,
+                    AnchorName = "车队报点",
+                },
+                _ => null,
+            };
+            if (c == null) continue;
+            if (!seenConvoyLines.Add(item.RawLine)) continue; // 旧行（含上一轮的陈旧情报）
+            if (turretRelocationPending) {
+                turretCons.Add(c);
+                fresh++;
             }
         }
-        var turretCons = new List<IGeoConstraint>();
-        if (turretRelocationPending) {
-            if (zoneCell != null && zoneCell != zoneCellAtDetect) {
-                lastTurretZoneCell = zoneCell; // 新公告：车队卡参数就位
-                for (var i = lastZoneItemIdx + 1; i < doc.Items.Count; ++i) {
-                    var item = doc.Items[i];
-                    switch (item.Kind) {
-                        case "turretDist":
-                            turretCons.Add(new DistanceCircle {
-                                Center = new Vector2(item.Value2, item.Value3), RadiusKm = item.Value1,
-                                AnchorName = "车队报点",
-                            });
-                            break;
-                        case "turretBearing":
-                            turretCons.Add(new BearingLine {
-                                Origin = new Vector2(item.Value2, item.Value3), BearingDeg = item.Value1,
-                                AnchorName = "车队报点",
-                            });
-                            break;
-                    }
-                }
-            }
-            else {
-                var stale = 0;
-                foreach (var item in doc.Items) {
-                    if (item.Kind is "turretDist" or "turretBearing") stale++;
-                }
-                if (verbose && stale > 0) {
-                    MelonLogger.Msg($"[Intel] 新大格公告未到，忽略纸带上 {stale} 条上一轮的车队报告");
-                }
-            }
-        }
-        else if (zoneCell != null) {
-            lastTurretZoneCell = zoneCell;
+        if (verbose && fresh > 0) {
+            MelonLogger.Msg($"[Intel] 新增 {fresh} 条车队报告（本轮累计 {turretCons.Count} 条约束）");
         }
 
         if (turretRelocationPending && turretCons.Count >= 2) {
