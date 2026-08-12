@@ -80,12 +80,15 @@ public class IntelSystem {
     private string lastIntelHash = "";
     private IntPtr lastMissionPtr;
 
-    // 紧急转移：ConvoyAssist 检测到炮位移动后置位。期间纸带上的旧"铁巢"网格行不再可信；
-    // 出现不同的新网格行（后勤车队情报到位）时自动解除。
+    // 紧急转移：ConvoyAssist 检测到炮位移动后置位。期间纸带上的旧"铁巢"网格行、
+    // 旧大格公告与旧车队报告全都不可信（纸带按时间累积，陈旧情报隔离见 BuildCandidateResults 阶段 2.5）。
     private bool turretRelocationPending;
-    private Vector2 staleTurretGrid;
     /// <summary>转移状态对外只读（ConvoyAssist 的自动车队循环据此判断是否继续打卡）。</summary>
     public bool TurretRelocationPending => turretRelocationPending;
+    /// <summary>检测到转移那一刻纸带上的大格公告（上一轮残留）。与它相同的公告 = 旧公告，新公告未到。</summary>
+    private string? zoneCellAtDetect;
+    /// <summary>车队情报已解出本轮新炮位（转移期间唯一可信的锚点来源）。</summary>
+    private bool turretAnchorFromConvoy;
     /// <summary>最近一次解析到的"铁巢新位置位于X某处"大格公告（自动车队卡参数）。</summary>
     private string? lastTurretZoneCell;
 
@@ -173,17 +176,20 @@ public class IntelSystem {
         WindowLines.Clear();
         turretRelocationPending = false;
         lastTurretZoneCell = null;
+        zoneCellAtDetect = null;
+        turretAnchorFromConvoy = false;
     }
 
     /// <summary>
-    /// ConvoyAssist 通报：铁巢已紧急转移。记下当前（即将过时的）炮位并立即重解析——
-    /// 此后 TryGetTurretGrid 会拒绝与旧值相同的"铁巢"锚点，直到纸带出现新位置。
+    /// ConvoyAssist 通报：铁巢已紧急转移。记下纸带上当前的大格公告（用于区分新旧公告），
+    /// 并立即重解析——此后在新大格公告出现前，TryGetTurretGrid 拒绝一切纸带炮位来源。
     /// </summary>
     public void OnTurretRelocated() {
-        if (anchors.TryGetValue("铁巢", out var g)) staleTurretGrid = g;
+        zoneCellAtDetect = lastTurretZoneCell; // 上一轮的公告（可能为 null=本任务首次转移）
+        lastTurretZoneCell = null;
+        turretAnchorFromConvoy = false;
         turretRelocationPending = true;
-        lastTurretZoneCell = null; // 上次转移残留的大格公告已过时，等本次的新公告
-        MelonLogger.Msg("[Intel] 铁巢已转移：旧炮位锚点作废，等待新位置情报（后勤车队/新报文）");
+        MelonLogger.Msg("[Intel] 铁巢已转移：旧炮位锚点作废，等待新大格公告与车队情报");
         Survey(full: false);
     }
 
@@ -575,30 +581,57 @@ public class IntelSystem {
 
         // 阶段 2.5：后勤车队（位置报告卡）报文 → 铁巢新位置解算。
         // 每条报告是对铁巢的一条几何约束（距离圆/方位线，锚点坐标行内自带）；
-        // 唯一解才接受（双解歧义时等更多报告，由 AutoConvoy 继续打卡）；接受后注册为
-        // "铁巢"锚点——TryGetTurretGrid 发现与旧值不同会自动解除转移状态、补摆棋子。
+        // 唯一解才接受（双解歧义时等更多报告，由 AutoConvoy 继续打卡）。
+        //
+        // 陈旧情报隔离（2026-08-13 实测教训：二次转移时旧报告秒解出旧位置并错误"确认"）：
+        // 纸带按时间累积，上一轮的"位于X某处"公告与车队报告全都还在纸上。因此——
+        //  1) 大格公告与检测到转移时相同（或没来过公告）→ 本轮转移的新公告未打印，
+        //     全部车队报告视为上一轮的陈旧情报，一律忽略，也不更新车队卡参数；
+        //  2) 新大格公告出现 → 只采纳"最后一条公告之后"的报告（此前的是上一轮的）。
         string? zoneCell = null;
-        var turretCons = new List<IGeoConstraint>();
-        foreach (var item in doc.Items) {
-            switch (item.Kind) {
-                case "turretZone":
-                    zoneCell = item.AnchorText;
-                    break;
-                case "turretDist":
-                    turretCons.Add(new DistanceCircle {
-                        Center = new Vector2(item.Value2, item.Value3), RadiusKm = item.Value1,
-                        AnchorName = "车队报点",
-                    });
-                    break;
-                case "turretBearing":
-                    turretCons.Add(new BearingLine {
-                        Origin = new Vector2(item.Value2, item.Value3), BearingDeg = item.Value1,
-                        AnchorName = "车队报点",
-                    });
-                    break;
+        var lastZoneItemIdx = -1;
+        for (var i = 0; i < doc.Items.Count; ++i) {
+            if (doc.Items[i].Kind == "turretZone") {
+                zoneCell = doc.Items[i].AnchorText;
+                lastZoneItemIdx = i;
             }
         }
-        lastTurretZoneCell = zoneCell ?? lastTurretZoneCell;
+        var turretCons = new List<IGeoConstraint>();
+        if (turretRelocationPending) {
+            if (zoneCell != null && zoneCell != zoneCellAtDetect) {
+                lastTurretZoneCell = zoneCell; // 新公告：车队卡参数就位
+                for (var i = lastZoneItemIdx + 1; i < doc.Items.Count; ++i) {
+                    var item = doc.Items[i];
+                    switch (item.Kind) {
+                        case "turretDist":
+                            turretCons.Add(new DistanceCircle {
+                                Center = new Vector2(item.Value2, item.Value3), RadiusKm = item.Value1,
+                                AnchorName = "车队报点",
+                            });
+                            break;
+                        case "turretBearing":
+                            turretCons.Add(new BearingLine {
+                                Origin = new Vector2(item.Value2, item.Value3), BearingDeg = item.Value1,
+                                AnchorName = "车队报点",
+                            });
+                            break;
+                    }
+                }
+            }
+            else {
+                var stale = 0;
+                foreach (var item in doc.Items) {
+                    if (item.Kind is "turretDist" or "turretBearing") stale++;
+                }
+                if (verbose && stale > 0) {
+                    MelonLogger.Msg($"[Intel] 新大格公告未到，忽略纸带上 {stale} 条上一轮的车队报告");
+                }
+            }
+        }
+        else if (zoneCell != null) {
+            lastTurretZoneCell = zoneCell;
+        }
+
         if (turretRelocationPending && turretCons.Count >= 2) {
             var solved = GeoSolver.Solve(turretCons);
             solved.RemoveAll(c => !IsOnMap(c.Point));
@@ -622,6 +655,7 @@ public class IntelSystem {
                 }
                 else {
                     RegisterAnchor("铁巢", best.Point);
+                    turretAnchorFromConvoy = true; // 唯一可信的新炮位来源，TryGetTurretGrid 据此解除转移
                     MelonLogger.Msg($"[Intel] 车队情报解出铁巢新位置: ({best.Point.x:F2},{best.Point.y:F2}) " +
                                     $"score={best.Score:F3}（{turretCons.Count} 条约束）");
                 }
@@ -1426,11 +1460,12 @@ public class IntelSystem {
         // 报文/笔记本里的"铁巢"网格行
         foreach (var alias in TurretAliases) {
             if (!anchors.TryGetValue(alias, out gridPos)) continue;
+            if (turretRelocationPending && !turretAnchorFromConvoy) {
+                // 转移待定且车队尚未解出：纸带上的一切"铁巢"锚点都是上一轮的陈旧情报
+                gridPos = default;
+                return false;
+            }
             if (turretRelocationPending) {
-                if (Vector2.Distance(gridPos, staleTurretGrid) < 0.01f) {
-                    gridPos = default;
-                    return false; // 纸带上仍是旧位置，不可信
-                }
                 turretRelocationPending = false;
                 MelonLogger.Msg($"[Intel] 铁巢新位置已确认: ({gridPos.x:F2},{gridPos.y:F2})，转移状态解除");
             }
