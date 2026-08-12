@@ -182,6 +182,7 @@ public class IntelSystem {
     public void OnTurretRelocated() {
         if (anchors.TryGetValue("铁巢", out var g)) staleTurretGrid = g;
         turretRelocationPending = true;
+        lastTurretZoneCell = null; // 上次转移残留的大格公告已过时，等本次的新公告
         MelonLogger.Msg("[Intel] 铁巢已转移：旧炮位锚点作废，等待新位置情报（后勤车队/新报文）");
         Survey(full: false);
     }

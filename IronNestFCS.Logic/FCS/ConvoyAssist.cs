@@ -35,6 +35,8 @@ public class ConvoyAssist {
     private float nextPollTime;
     private bool hasBaseline;
     private Vector3 lastIconPos;
+    private bool inTransit;      // 转移移动是持续数十秒的滑动：整个episode只通报一次
+    private float lastMoveTime;
     private TurretLocationIcon? cachedIcon;
     private IntPtr lastMissionPtr;
 
@@ -96,6 +98,7 @@ public class ConvoyAssist {
             cachedIcon = null;
             convoyRunning = false;
             exhaustedCell = null;
+            inTransit = false;
         }
         if (fm == null) return;
 
@@ -112,10 +115,20 @@ public class ConvoyAssist {
             return;
         }
 
-        if (Vector3.Distance(iconPos, lastIconPos) <= MovedThreshold) return;
-        MelonLogger.Msg($"[Convoy] 检测到铁巢转移: 图标 {Fmt(lastIconPos)}→{Fmt(iconPos)}");
-        lastIconPos = iconPos;
-        intel.OnTurretRelocated();
+        if (Vector3.Distance(iconPos, lastIconPos) > MovedThreshold) {
+            lastIconPos = iconPos;
+            lastMoveTime = Time.realtimeSinceStartup;
+            if (!inTransit) {
+                inTransit = true;
+                MelonLogger.Msg($"[Convoy] 检测到铁巢转移（滑动开始）: 图标自 {Fmt(iconPos)} 起移动");
+                intel.OnTurretRelocated();
+            }
+            return; // 滑动途中不重复通报（实测转移是持续数十秒的连续滑动）
+        }
+        if (inTransit && Time.realtimeSinceStartup - lastMoveTime > 3f) {
+            inTransit = false;
+            MelonLogger.Msg($"[Convoy] 转移滑动结束: 图标停在 {Fmt(iconPos)}");
+        }
     }
 
     private TurretLocationIcon? FindTurretIcon() {
@@ -176,23 +189,37 @@ public class ConvoyAssist {
                     MelonLogger.Warning($"[Convoy] 未找到位置报告卡或征用槽（card={(card != null)} slot={(slot != null)}），停止");
                     yield break;
                 }
-                if (slot.HasCard) {
-                    MelonLogger.Msg("[Convoy] 征用槽被占用（玩家正在操作？），本次放弃，等下一轮情报刷新再试");
-                    yield break;
-                }
 
                 // 打卡全程持桌面锁：与买弹药/任务流程互斥（同一台征用设备）
                 yield return fcs.AcquireDeskLock();
                 try {
-                    MelonLogger.Msg($"[Convoy] 第 {attempt}/{MaxConvoyAttempts} 次打卡: {card.CurrentDefinition?.ID} → {cell}");
-                    card.transform.position = SlotDropPos;
-                    var drag = card.GetComponent<DraggableItem>();
-                    if (drag != null) drag.MoveToSlot();
-                    yield return new WaitForSeconds(0.8f);
+                    // 槽里躺着别的卡（实测：玩家打过的紧急转移卡会留在槽里）→ 用槽自己的 API 弹出；
+                    // 躺着的就是位置报告卡（上次尝试残留）→ 直接复用，跳过物理入槽
+                    var alreadyInSlot = slot.CurrentCard == card;
+                    if (slot.HasCard && !alreadyInSlot) {
+                        MelonLogger.Msg($"[Convoy] 征用槽被 {slot.CurrentCard?.CurrentDefinition?.ID ?? "?"} 占用，先弹出");
+                        try { slot.RemoveCard(slot.CurrentCard, true); }
+                        catch (Exception ex) { MelonLogger.Error($"[Convoy] 弹出占槽卡牌失败: {ex.Message}"); }
+                        yield return new WaitForSeconds(0.5f);
+                        if (slot.HasCard) {
+                            MelonLogger.Warning("[Convoy] 占槽卡牌弹出失败，本次放弃");
+                            yield break;
+                        }
+                    }
 
-                    if (slot.CurrentCard == null) {
-                        MelonLogger.Warning("[Convoy] 卡牌未入槽，本次打卡失败");
-                        continue;
+                    if (!alreadyInSlot) {
+                        MelonLogger.Msg($"[Convoy] 第 {attempt}/{MaxConvoyAttempts} 次打卡: {card.CurrentDefinition?.ID} → {cell}");
+                        card.transform.position = SlotDropPos;
+                        var drag = card.GetComponent<DraggableItem>();
+                        if (drag != null) drag.MoveToSlot();
+                        yield return new WaitForSeconds(0.8f);
+                        if (slot.CurrentCard == null) {
+                            MelonLogger.Warning("[Convoy] 卡牌未入槽，本次打卡失败");
+                            continue;
+                        }
+                    }
+                    else {
+                        MelonLogger.Msg($"[Convoy] 第 {attempt}/{MaxConvoyAttempts} 次打卡: 复用槽内位置报告卡 → {cell}");
                     }
                     // 设大格参数：控制台里的 Coordinate 变量（L=列字母, N=行号）
                     var console = slot.CurrentCardConsole;
