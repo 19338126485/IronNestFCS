@@ -12,6 +12,8 @@ namespace IronNestFCS.Logic.FCS;
 ///  - <see cref="Survey"/>：读两台电报机纸带 + 笔记本 → 解析（<see cref="IntelParser"/>）→
 ///    按主题逐组几何解算（<see cref="GeoSolver"/>）→ 候选位置。主题解出后注册为锚点，
 ///    供后续主题链式引用（实测：敌方防空炮以"敌方炮兵指挥中心#2"为锚点）。
+///    锚点有多解歧义时下游主题对每个分支各解一次；图外交点直接剪除；
+///    唯一匹配的友方实体坐标作为地面真值（锚点优先、主题多解确认），敌方实体绝不读取。
 ///  - 候选有生命周期：登记簿按主题名去重，重复 Survey 原地更新坐标、保留用户状态；
 ///    状态：待处理 / 已落子(✓) / 已忽略(✗)。Next 只在待处理里轮转，Del 忽略当前条。
 ///  - 每个待处理候选在地图桌面上有一个 3D 标记环 + 序号标签（程序网格，白色=正常，黄色=低置信度）。
@@ -32,12 +34,20 @@ public class IntelSystem {
 
     private FSC? fcs;
 
-    /// <summary>锚点名 → 网格坐标。来源：gridref 行 + 已解算主题（链式）。每次 Survey 重建。</summary>
+    /// <summary>锚点名 → 首选网格坐标。来源：gridref 行 + 已解算主题（链式）。每次 Survey 重建。</summary>
     private readonly Dictionary<string, Vector2> anchors = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>锚点名 → 全部候选坐标（多解歧义沿锚点链传播：下游主题对每个分支各解一次）。</summary>
+    private readonly Dictionary<string, List<Vector2>> anchorOptions = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>本轮 Survey 产出过的登记簿 key（用于收回不再成立的 alt 假设）。</summary>
+    private readonly HashSet<string> touchedKeys = new();
+    private bool verbosePass; // 本次 Survey 是否详细日志（实体锚点匹配等例行输出只在其开启时打印）
 
     // ===== 候选登记簿（按主题名去重，跨 Survey 保留用户状态） =====
     private sealed class CandidateEntry {
         public int Seq;                    // 固定序号（地图标签与窗口行的对应关系）
+        public string Key = "";            // 登记簿 key（主题名，alt 带 "(alt)" 后缀）
         public SurveyCandidate Cand = new();
         public bool Placed;
         public bool Ignored;
@@ -85,6 +95,7 @@ public class IntelSystem {
         insertionOrder.Clear();
         registry.Clear();
         anchors.Clear();
+        anchorOptions.Clear();
         Candidates.Clear();
         activeEntries.Clear();
         WindowLines.Clear();
@@ -141,6 +152,7 @@ public class IntelSystem {
         insertionOrder.Clear();
         registry.Clear();
         anchors.Clear();
+        anchorOptions.Clear();
         Candidates.Clear();
         activeEntries.Clear();
         CurrentIndex = 0;
@@ -205,6 +217,7 @@ public class IntelSystem {
     public void Survey() => Survey(full: true);
 
     private void Survey(bool full) {
+        verbosePass = full;
         if (full) {
             MelonLogger.Msg("[Intel] ==== Survey start ====");
             if (!diagDone) {
@@ -214,12 +227,15 @@ public class IntelSystem {
         }
 
         anchors.Clear();
+        anchorOptions.Clear();
         var doc = CollectIntel();
         if (full) MelonLogger.Msg($"[Intel] 解析: {doc.Items.Count} 条散条目, {doc.Subjects.Count} 个主题");
 
         var results = BuildCandidateResults(doc, full);
         FitAffine();
+        touchedKeys.Clear();
         SyncRegistry(results);
+        RetractStaleAlts();
         SyncCandidates();
         RebuildWindowLines();
 
@@ -299,7 +315,10 @@ public class IntelSystem {
     /// <summary>
     /// 三阶段解算，产出有序候选列表（不写登记簿）：
     /// 1) gridref 行 → 锚点字典（注册全名+末词别名；指向敌方的行同时成为直接候选）；
-    /// 2) 主题按报文顺序逐组解算，解出即注册为锚点（链式）；双解接近时备选也列出；
+    /// 2) 主题按报文顺序逐组解算，解出即注册为锚点（链式）。锚点有多解歧义时，
+    ///    下游主题对每个分支各解一次（2026-08 实测教训：住宅线圆双解选错支，
+    ///    下游巡洋舰的真解就落在另一支推出的第三个交点上）；图外交点必为假解，剪除；
+    ///    主题名唯一匹配友方实体时以实体坐标为地面真值，吸附最近分支并丢弃其余；
     /// 3) 散条目：angleDist 直接定点（锚点=炮位），零散 bearing/distance 汇总投票。
     /// </summary>
     private List<SurveyCandidate> BuildCandidateResults(IntelDocument doc, bool verbose) {
@@ -323,40 +342,135 @@ public class IntelSystem {
             }
         }
 
-        // 阶段 2：主题（有序，链式锚点）
+        // 阶段 2：主题（有序，链式锚点，多解分支传播）
         foreach (var subject in doc.Subjects) {
-            var constraints = new List<IGeoConstraint>();
+            // 按"不同锚点名"收集各锚点的分支选项（同一锚点被多条约束引用时分支必须一致）
+            var items = new List<ParsedItem>();
+            var anchorNames = new List<string>();
+            var optionsByAnchor = new Dictionary<string, List<Vector2>>();
             foreach (var item in subject.Constraints) {
-                var c = ResolveConstraint(item);
-                if (c != null) constraints.Add(c);
+                if (item.Kind != "bearing" && item.Kind != "distance") continue;
+                if (!TryGetAnchorOptions(item.AnchorText, out var opts)) {
+                    MelonLogger.Warning($"[Intel] 无法解析锚点 '{item.AnchorText}'（行: {item.RawLine}）");
+                    continue;
+                }
+                items.Add(item);
+                if (!optionsByAnchor.ContainsKey(item.AnchorText)) {
+                    optionsByAnchor[item.AnchorText] = opts;
+                    anchorNames.Add(item.AnchorText);
+                }
             }
-            if (constraints.Count == 0) continue;
-            if (verbose) {
-                foreach (var c in constraints) MelonLogger.Msg($"[Intel] 约束[{subject.Name}]: {c.Describe()}");
-            }
-
-            var solved = GeoSolver.Solve(constraints);
-            if (solved.Count == 0) {
-                if (verbose) MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 约束不足（{constraints.Count} 条），无法定位");
+            if (items.Count < 2) {
+                if (verbose && items.Count == 1)
+                    MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 约束不足（1 条），无法定位");
                 continue;
             }
-            var best = solved[0];
+
+            // 分支组合（上限 8，防组合爆炸；超出时优先保留各锚点首选分支）
+            var combos = new List<List<Vector2>> { new() };
+            foreach (var an in anchorNames) {
+                var next = new List<List<Vector2>>();
+                foreach (var combo in combos) {
+                    foreach (var opt in optionsByAnchor[an]) {
+                        var branch = new List<Vector2>(combo) { opt };
+                        next.Add(branch);
+                        if (next.Count >= 8) break;
+                    }
+                    if (next.Count >= 8) break;
+                }
+                combos = next;
+            }
+
+            var merged = new List<SurveyCandidate>();
+            foreach (var combo in combos) {
+                var posByAnchor = new Dictionary<string, Vector2>();
+                for (var k = 0; k < anchorNames.Count; ++k) posByAnchor[anchorNames[k]] = combo[k];
+                var constraints = new List<IGeoConstraint>();
+                foreach (var item in items) {
+                    var p = posByAnchor[item.AnchorText];
+                    var name = string.IsNullOrWhiteSpace(item.AnchorText) ? "Turret" : item.AnchorText;
+                    constraints.Add(item.Kind == "bearing"
+                        ? new BearingLine { Origin = p, BearingDeg = item.Value1, AnchorName = name }
+                        : new DistanceCircle { Center = p, RadiusKm = item.Value1, AnchorName = name });
+                }
+                if (verbose) {
+                    foreach (var c in constraints) MelonLogger.Msg($"[Intel] 约束[{subject.Name}]: {c.Describe()}");
+                }
+                foreach (var s in GeoSolver.Solve(constraints)) {
+                    var dup = false;
+                    foreach (var m in merged) {
+                        if (Vector2.Distance(m.Point, s.Point) < 0.05f) { dup = true; break; }
+                    }
+                    if (!dup) merged.Add(s);
+                }
+            }
+
+            // 图外剪枝：越出地图的交点必为假解（实测远支曾解出 y=16.9 的图外点）
+            var beforePrune = merged.Count;
+            merged.RemoveAll(c => !IsOnMap(c.Point));
+            if (verbose && merged.Count < beforePrune) {
+                MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 剪除 {beforePrune - merged.Count} 个图外假解");
+            }
+            if (merged.Count == 0) {
+                if (verbose) MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 所有交点均在图外，无法定位");
+                continue;
+            }
+            merged.Sort((x, y) => x.Score.CompareTo(y.Score));
+
+            // 友方实体确认：主题名唯一匹配友方实体 → 实体坐标是地面真值，
+            // 吸附最近分支（报文整数度舍入归零），其余分支直接丢弃
+            var confirm = FindUniqueFriendlyEntity(subject.Name);
+            if (confirm != null) {
+                var truth = WorldToGrid(confirm.Position);
+                SurveyCandidate? nearest = null;
+                var nd = float.MaxValue;
+                foreach (var c in merged) {
+                    var d = Vector2.Distance(c.Point, truth);
+                    if (d < nd) { nd = d; nearest = c; }
+                }
+                if (nearest != null && nd <= 1f) {
+                    nearest.Point = truth;
+                    nearest.Score = 0f;
+                    nearest.Basis += $" | 实体确认 {confirm.ID}";
+                    merged.Clear();
+                    merged.Add(nearest);
+                    if (verbose) {
+                        MelonLogger.Msg($"[Intel] 主题 '{subject.Name}' 经友方实体 {confirm.ID} 确认 " +
+                                        $"@ ({truth.x:F2},{truth.y:F2})，多解歧义已消除");
+                    }
+                }
+                else if (verbose) {
+                    MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 实体 {confirm.ID} 位置与任何解都不符，保留几何解");
+                }
+            }
+
+            var best = merged[0];
             best.Name = subject.Name;
             best.TokenName ??= subject.TokenName;
             results.Add(best);
-            RegisterAnchor(subject.Name, best.Point); // 链式：后续主题可以它为锚点
+            var emitted = new List<Vector2> { best.Point };
 
-            // 双解歧义：第二名分数接近时一并列出，由 Next/Place 人工裁决
-            if (solved.Count > 1 && solved[1].Score - best.Score < GeoSolver.AmbiguityThresholdKm) {
-                var alt = solved[1];
-                alt.Name = subject.Name + "(alt)";
+            // 多解歧义：分数接近首选的分支一并列出（(alt)/(alt2)/(alt3)，上限 4 个），
+            // 由 Next/Place 人工裁决；同时全部注册为锚点分支供下游主题枚举
+            var altCount = 0;
+            for (var i = 1; i < merged.Count; ++i) {
+                if (merged[i].Score - best.Score >= GeoSolver.AmbiguityThresholdKm) break;
+                if (altCount >= 3) {
+                    if (verbose) MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 歧义分支过多，其余省略");
+                    break;
+                }
+                var alt = merged[i];
+                alt.Name = subject.Name + (altCount == 0 ? "(alt)" : $"(alt{altCount + 1})");
                 alt.TokenName ??= subject.TokenName;
                 results.Add(alt);
+                emitted.Add(alt.Point);
+                altCount++;
                 if (verbose) {
-                    MelonLogger.Msg($"[Intel] 主题 '{subject.Name}' 存在双解歧义: " +
+                    MelonLogger.Msg($"[Intel] 主题 '{subject.Name}' 存在多解歧义: " +
                                     $"备选 ({alt.Point.x:F2},{alt.Point.y:F2}) score={alt.Score:F3}");
                 }
             }
+            RegisterAnchorOptions(subject.Name, emitted);
         }
 
         // 阶段 3：散条目
@@ -370,9 +484,14 @@ public class IntelSystem {
                     }
                     var dir = new Vector2(Mathf.Sin(item.Value1 * Mathf.Deg2Rad),
                                           Mathf.Cos(item.Value1 * Mathf.Deg2Rad));
+                    var point = origin + dir * item.Value2;
+                    if (!IsOnMap(point)) {
+                        if (verbose) MelonLogger.Msg($"[Intel] 誊抄落点在图外，跳过: {item.RawLine}");
+                        break;
+                    }
                     results.Add(new SurveyCandidate {
                         Name = "marker:" + item.RawLine,
-                        Point = origin + dir * item.Value2,
+                        Point = point,
                         Score = 0f,
                         Basis = $"marker note: {item.RawLine}",
                         TokenName = item.TokenName,
@@ -389,6 +508,7 @@ public class IntelSystem {
         }
         if (loose.Count > 0) {
             foreach (var s in GeoSolver.Solve(loose)) {
+                if (!IsOnMap(s.Point)) continue;
                 s.Name = "loose:" + s.Basis;
                 results.Add(s);
             }
@@ -396,16 +516,26 @@ public class IntelSystem {
         return results;
     }
 
+    // 地图边界（km）：全任务地图 20×10（列 A–T、行 1–10），留 0.5km 边距。
+    private static bool IsOnMap(Vector2 p) =>
+        p.x is >= -0.5f and <= 20.5f && p.y is >= -0.5f and <= 10.5f;
+
     /// <summary>
     /// 把本次解算结果同步进登记簿：同名条目原地更新（保留 已落子/已忽略 状态），
     /// 新条目登记并生成地图标记。情报纸带保留历史，消失的条目不清除（新任务由 ResetMissionState 处理）。
+    /// 图外结果直接跳过（防御性；正常路径在 BuildCandidateResults 已剪枝）。
     /// </summary>
     private void SyncRegistry(List<SurveyCandidate> results) {
         foreach (var r in results) {
             var key = string.IsNullOrEmpty(r.Name) ? r.Basis : r.Name;
+            if (!IsOnMap(r.Point)) {
+                MelonLogger.Msg($"[Intel] 跳过图外候选: [{key}] ({r.Point.x:F2},{r.Point.y:F2})");
+                continue;
+            }
+            touchedKeys.Add(key);
             if (registry.TryGetValue(key, out var e)) {
-                var moved = Vector2.Distance(e.Cand.Point, r.Point) > 0.01f;
-                var wasPlaced = e.Placed;
+                var old = e.Cand.Point;
+                var moved = Vector2.Distance(old, r.Point) > 0.01f;
                 e.Cand.Point = r.Point;
                 e.Cand.Score = r.Score;
                 e.Cand.Basis = r.Basis;
@@ -413,20 +543,37 @@ public class IntelSystem {
                 e.Cand.TokenName ??= r.TokenName;
                 if (moved) {
                     if (e.Marker != null) PositionMarker(e);
-                    if (wasPlaced) {
-                        MelonLogger.Msg($"[Intel] 情报修正: [{e.Cand.Name}] 新坐标 ({r.Point.x:F2},{r.Point.y:F2})" +
-                                        "（棋子不会自动跟着动，需要请手动调整）");
+                    if (Vector2.Distance(old, r.Point) > 0.1f) {
+                        // 显著修正必须可见：之前"仅已落子才记录"导致锚点确认后的静默大跳无人察觉
+                        MelonLogger.Msg($"[Intel] 情报修正: [{e.Cand.Name}] ({old.x:F2},{old.y:F2}) → " +
+                                        $"({r.Point.x:F2},{r.Point.y:F2})" +
+                                        (e.Placed ? "（棋子不会自动跟着动，需要请手动调整）" : ""));
                     }
                 }
             }
             else {
-                e = new CandidateEntry { Cand = r, Seq = ++seqCounter };
+                e = new CandidateEntry { Cand = r, Seq = ++seqCounter, Key = key };
                 registry[key] = e;
                 insertionOrder.Add(e);
                 CreateMarkerVisuals(e);
                 MelonLogger.Msg($"[Intel] 新目标 #{e.Seq}: [{r.Name}] ({r.Point.x:F2},{r.Point.y:F2})" +
                                 $"{(r.LowConfidence ? " [低置信度]" : "")}");
             }
+        }
+    }
+
+    /// <summary>
+    /// 收回陈旧备选：本轮解算不再出现的 (alt) 假设视为已被排除（锚点被实体确认、
+    /// 或分支随新情报消失），自动忽略并撤下标记；已落子的保留（棋子是玩家的决定）。
+    /// </summary>
+    private void RetractStaleAlts() {
+        foreach (var e in insertionOrder) {
+            if (e.Placed || e.Ignored) continue;
+            if (!e.Key.Contains("(alt")) continue;
+            if (touchedKeys.Contains(e.Key)) continue;
+            e.Ignored = true;
+            DestroyVisuals(e);
+            MelonLogger.Msg($"[Intel] 备选假设被收回: #{e.Seq} [{e.Cand.Name}]");
         }
     }
 
@@ -459,12 +606,13 @@ public class IntelSystem {
         return n;
     }
 
-    /// <summary>把解析条目翻译成几何约束（解锚点）；失败打日志并返回 null。</summary>
+    /// <summary>把解析条目翻译成几何约束（取锚点首选分支）；失败打日志并返回 null。</summary>
     private IGeoConstraint? ResolveConstraint(ParsedItem item) {
-        if (!TryResolveAnchor(item.AnchorText, out var anchor)) {
+        if (!TryGetAnchorOptions(item.AnchorText, out var opts)) {
             MelonLogger.Warning($"[Intel] 无法解析锚点 '{item.AnchorText}'（行: {item.RawLine}）");
             return null;
         }
+        var anchor = opts[0];
         var name = string.IsNullOrWhiteSpace(item.AnchorText) ? "Turret" : item.AnchorText;
         return item.Kind switch {
             "bearing" => new BearingLine { Origin = anchor, BearingDeg = item.Value1, AnchorName = name },
@@ -473,13 +621,18 @@ public class IntelSystem {
         };
     }
 
-    private void RegisterAnchor(string name, Vector2 pos) {
-        if (string.IsNullOrWhiteSpace(name)) return;
-        anchors[name] = pos;
+    private void RegisterAnchor(string name, Vector2 pos) =>
+        RegisterAnchorOptions(name, new List<Vector2> { pos });
+
+    private void RegisterAnchorOptions(string name, List<Vector2> positions) {
+        if (string.IsNullOrWhiteSpace(name) || positions.Count == 0) return;
+        anchors[name] = positions[0];
+        anchorOptions[name] = positions;
         // 长名注册末词别名："卡斯特尔德费尔斯海滩 总站" → "总站"
         var parts = name.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length > 1 && !anchors.ContainsKey(parts[^1])) {
-            anchors[parts[^1]] = pos;
+        if (parts.Length > 1 && !anchorOptions.ContainsKey(parts[^1])) {
+            anchors[parts[^1]] = positions[0];
+            anchorOptions[parts[^1]] = positions;
         }
     }
 
@@ -964,43 +1117,73 @@ public class IntelSystem {
     // ================= 锚点解析 =================
 
     /// <summary>
-    /// 锚点名 → 网格坐标。顺序：炮位别名 → 锚点字典（精确/包含匹配）→ 友方实体模糊匹配。
+    /// 锚点名 → 候选网格坐标列表（通常 1 个；上游主题有多解歧义时多个，沿链传播）。
+    /// 顺序：炮位别名 → 唯一友方实体（地面真值，含 #n 编号限定）→ 锚点字典（精确/包含匹配）。
     /// 敌方实体刻意不做锚点：它们的位置本身可能就是待解目标，直接读等于作弊。
     /// </summary>
-    private bool TryResolveAnchor(string anchorText, out Vector2 gridPos) {
-        gridPos = default;
+    private bool TryGetAnchorOptions(string anchorText, out List<Vector2> options) {
+        options = new List<Vector2>();
         if (string.IsNullOrWhiteSpace(anchorText)) {
-            return TryGetTurretGrid(out gridPos);
+            if (TryGetTurretGrid(out var t)) options.Add(t);
+            return options.Count > 0;
         }
         var a = anchorText.Trim();
         foreach (var alias in TurretAliases) {
             if (a.Contains(alias, StringComparison.OrdinalIgnoreCase)) {
-                return TryGetTurretGrid(out gridPos);
+                if (TryGetTurretGrid(out var t)) options.Add(t);
+                return options.Count > 0;
             }
         }
-        if (a.Contains("我")) return TryGetTurretGrid(out gridPos);
+        if (a.Contains("我")) {
+            if (TryGetTurretGrid(out var t)) options.Add(t);
+            return options.Count > 0;
+        }
 
-        if (TryGetAnchorPos(a, out gridPos)) return true;
-
-        var e = FindFriendlyEntity(a);
-        if (e != null) {
-            gridPos = WorldToGrid(e.Position);
-            MelonLogger.Msg($"[Intel] 锚点 '{a}' → 实体 {e.ID} @ ({gridPos.x:F2},{gridPos.y:F2})");
+        // 唯一匹配的友方实体 = 地面真值：观测员/参考点都是友方单位，实体坐标是精确值，
+        // 优于报文的 0.1km 舍入网格与几何解算的两个猜测分支
+        var ent = FindUniqueFriendlyEntity(a);
+        if (ent != null) {
+            var g = WorldToGrid(ent.Position);
+            if (verbosePass) MelonLogger.Msg($"[Intel] 锚点 '{a}' → 实体 {ent.ID} @ ({g.x:F2},{g.y:F2})");
+            options.Add(g);
             return true;
         }
-        return false;
-    }
 
-    private bool TryGetAnchorPos(string name, out Vector2 pos) {
-        if (anchors.TryGetValue(name, out pos)) return true;
-        foreach (var kv in anchors) {
-            if (kv.Key.Contains(name, StringComparison.OrdinalIgnoreCase) ||
-                name.Contains(kv.Key, StringComparison.OrdinalIgnoreCase)) {
-                pos = kv.Value;
+        if (anchorOptions.TryGetValue(a, out var exact)) {
+            options.AddRange(exact);
+            return true;
+        }
+        foreach (var kv in anchorOptions) {
+            if (kv.Key.Contains(a, StringComparison.OrdinalIgnoreCase) ||
+                a.Contains(kv.Key, StringComparison.OrdinalIgnoreCase)) {
+                options.AddRange(kv.Value);
                 return true;
             }
         }
         return false;
+    }
+
+    /// <summary>
+    /// 名字唯一匹配一个友方实体时返回它（锚点地面真值 / 主题多解确认）；多义或无匹配返回 null。
+    /// 名字含 "#n" 编号时要求实体 ID 也含相同编号（"观测员#1" → allyspotter#1，排除 #2）。
+    /// </summary>
+    private static MapEntity? FindUniqueFriendlyEntity(string name) {
+        const EntityRoles enemyBits = EntityRoles.Enemy | EntityRoles.Target | EntityRoles.OptionalTarget;
+        var fm = FireMission.Instance;
+        if (fm == null || fm.Entities == null) return null;
+        string? numTag = null;
+        var hash = name.IndexOf('#');
+        if (hash >= 0 && hash + 1 < name.Length) numTag = name.Substring(hash); // "#1"
+        MapEntity? found = null;
+        foreach (var kv in fm.Entities) {
+            var e = kv.Value;
+            if (e == null || (e.Role & enemyBits) != 0) continue;
+            if (!EntityMatches(e, name)) continue;
+            if (numTag != null && (e.ID == null || !e.ID.Contains(numTag))) continue;
+            if (found != null) return null; // 多义匹配，不敢用
+            found = e;
+        }
+        return found;
     }
 
     /// <summary>判断名字是否指向敌方实体；matched 输出匹配到的实体（无则 null）。</summary>
@@ -1010,8 +1193,6 @@ public class IntelSystem {
         const EntityRoles enemyBits = EntityRoles.Enemy | EntityRoles.Target | EntityRoles.OptionalTarget;
         return (matched.Role & enemyBits) != 0;
     }
-
-    private static MapEntity? FindFriendlyEntity(string name) => FindEntity(name, onlyFriendly: true);
 
     private static MapEntity? FindEntity(string name, bool onlyFriendly) {
         const EntityRoles enemyBits = EntityRoles.Enemy | EntityRoles.Target | EntityRoles.OptionalTarget;
