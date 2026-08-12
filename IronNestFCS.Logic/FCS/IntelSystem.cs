@@ -233,6 +233,7 @@ public class IntelSystem {
 
         var results = BuildCandidateResults(doc, full);
         FitAffine();
+        EnsureTurretPiecePlaced();
         touchedKeys.Clear();
         SyncRegistry(results);
         RetractStaleAlts();
@@ -806,6 +807,27 @@ public class IntelSystem {
         MelonLogger.Msg($"[Intel] 已放置 {tokenName}（编号 '{GetTokenLabel(freeToken)}'）" +
                         $" @ grid({grid.x:F2},{grid.y:F2}) → local({local.x:F3},{local.y:F3})");
         return true;
+    }
+
+    /// <summary>
+    /// 自动落炮塔棋子（每次 Survey 末尾执行，幂等）：报文"铁巢"网格行是每个任务必报的真值，
+    /// 而棋子通常停在托盘默认位——此时 T1~T4 按钮与 Fire 的相对测量（local 差值公式）全部失真。
+    /// 偏差 >0.05km 才移动；玩家已手动摆好（误差在报文 0.1km 舍入范围内）则不打扰。
+    /// </summary>
+    private void EnsureTurretPiecePlaced() {
+        if (!affineReady) return;
+        if (!anchors.TryGetValue("铁巢", out var grid)) return; // 本任务的报文还没打印炮位
+        var surface = GameObject.Find("Draggable Surface")?.transform;
+        var piece = GameObject.Find("Player Turret Piece")?.transform;
+        if (surface == null || piece == null) return;
+
+        var currentGrid = AffineInverse(piece.position);
+        if (Vector2.Distance(currentGrid, grid) <= 0.05f) return; // 已在正确位置
+
+        var local = surface.InverseTransformPoint(AffineForward(grid));
+        piece.localPosition = new Vector3(local.x, local.y, piece.localPosition.z);
+        MelonLogger.Msg($"[Intel] 已自动放置铁巢棋子: ({currentGrid.x:F2},{currentGrid.y:F2}) → " +
+                        $"grid({grid.x:F2},{grid.y:F2})（T1~T4/Fire 解算基准已校准）");
     }
 
     private void CaptureTokenHomes(Transform surface) {
