@@ -145,6 +145,16 @@ public class FcsSceneInteractor {
         AddRowButton("Fire", new Color(1f, 0.5f, 0f), _ => fcs.Intel.FireCurrentCandidate());
         AddRowButton("Del", Color.red, _ => fcs.Intel.DismissCurrent());
         AddRowButton("Reveal", Color.magenta, _ => fcs.Intel.RevealAll());
+        // Convoy：紧急转移后自动后勤车队征集开关（默认开，绿色）；自动打牌待报文格式侦察后接线
+        AddRowButton("Convoy", fcs.Convoy.AutoConvoy ? Color.green : Color.white, btn => {
+            var on = fcs.Convoy.ToggleAutoConvoy();
+            SetColor(btn, on ? Color.green : Color.white);
+        });
+        // NestGPS：作弊直读炮塔精确位置（默认关；开=红色警示，与 Reveal 同性质）
+        AddRowButton("NestGPS", fcs.Convoy.NestGps ? Color.red : Color.white, btn => {
+            var on = fcs.Convoy.ToggleNestGps();
+            SetColor(btn, on ? Color.red : Color.white);
+        });
 
         // 在本排按钮末尾追加一个按钮的局部辅助函数（沿用本方法的排版步进）。
         void AddRowButton(string label, Color color, Action<GameObject> onClick) {

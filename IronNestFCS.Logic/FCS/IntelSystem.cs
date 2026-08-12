@@ -80,6 +80,11 @@ public class IntelSystem {
     private string lastIntelHash = "";
     private IntPtr lastMissionPtr;
 
+    // 紧急转移：ConvoyAssist 检测到炮位移动后置位。期间纸带上的旧"铁巢"网格行不再可信；
+    // 出现不同的新网格行（后勤车队情报到位）时自动解除。
+    private bool turretRelocationPending;
+    private Vector2 staleTurretGrid;
+
     // 标记物资源（实例字段，ShutDown 清空；静态会钉住旧 ALC）
     private Mesh? ringMesh;
     private Material? markerMatNormal;
@@ -162,6 +167,18 @@ public class IntelSystem {
         affineReady = false;
         lastIntelHash = "";
         WindowLines.Clear();
+        turretRelocationPending = false;
+    }
+
+    /// <summary>
+    /// ConvoyAssist 通报：铁巢已紧急转移。记下当前（即将过时的）炮位并立即重解析——
+    /// 此后 TryGetTurretGrid 会拒绝与旧值相同的"铁巢"锚点，直到纸带出现新位置。
+    /// </summary>
+    public void OnTurretRelocated() {
+        if (anchors.TryGetValue("铁巢", out var g)) staleTurretGrid = g;
+        turretRelocationPending = true;
+        MelonLogger.Msg("[Intel] 铁巢已转移：旧炮位锚点作废，等待新位置情报（后勤车队/新报文）");
+        Survey(full: false);
     }
 
     // ================= 按钮 2：一键揭示全图（作弊） =================
@@ -224,6 +241,8 @@ public class IntelSystem {
                 DumpDiagnostics();
                 diagDone = true;
             }
+            // 卡牌侦察每次手动 Survey 都跑：卡牌状态随对局变化，需要覆盖打牌前后的快照
+            fcs?.Convoy.DumpCardRecon();
         }
 
         anchors.Clear();
@@ -816,7 +835,13 @@ public class IntelSystem {
     /// </summary>
     private void EnsureTurretPiecePlaced() {
         if (!affineReady) return;
-        if (!anchors.TryGetValue("铁巢", out var grid)) return; // 本任务的报文还没打印炮位
+        // 只用真值来源（NestGps 直读 / 报文网格行），不能用棋子自身位置兜底（那会恒等空转）；
+        // 转移后旧锚点被 TryGetTurretGrid 拒绝，此处自然暂停，等新情报到位自动补摆。
+        if (!TryGetTurretGrid(out var grid, allowPieceFallback: false)) {
+            if (turretRelocationPending && verbosePass)
+                MelonLogger.Msg("[Intel] 铁巢已转移且新位置未知，炮塔棋子暂不自动摆放");
+            return;
+        }
         var surface = GameObject.Find("Draggable Surface")?.transform;
         var piece = GameObject.Find("Player Turret Piece")?.transform;
         if (surface == null || piece == null) return;
@@ -1243,14 +1268,32 @@ public class IntelSystem {
         return false;
     }
 
-    private bool TryGetTurretGrid(out Vector2 gridPos) {
-        // 最权威：报文/笔记本里的"铁巢"网格行
+    /// <summary>
+    /// 炮位网格坐标。优先级：NestGps 作弊直读（精确）→ 报文/笔记本"铁巢"网格行 →
+    /// （可选）炮塔棋子逆仿射换算。紧急转移后（turretRelocationPending），与旧值相同的
+    /// 纸带锚点视为过时并拒绝；出现不同的新网格行时自动解除转移状态。
+    /// </summary>
+    private bool TryGetTurretGrid(out Vector2 gridPos, bool allowPieceFallback = true) {
+        // NestGps 作弊：TurretController 精确位置，跳过整个情报收集过程
+        if (fcs != null && fcs.Convoy.NestGps && fcs.Convoy.TryGetNestGpsGrid(out gridPos)) return true;
+
+        // 报文/笔记本里的"铁巢"网格行
         foreach (var alias in TurretAliases) {
-            if (anchors.TryGetValue(alias, out gridPos)) return true;
+            if (!anchors.TryGetValue(alias, out gridPos)) continue;
+            if (turretRelocationPending) {
+                if (Vector2.Distance(gridPos, staleTurretGrid) < 0.01f) {
+                    gridPos = default;
+                    return false; // 纸带上仍是旧位置，不可信
+                }
+                turretRelocationPending = false;
+                MelonLogger.Msg($"[Intel] 铁巢新位置已确认: ({gridPos.x:F2},{gridPos.y:F2})，转移状态解除");
+            }
+            return true;
         }
+
         // 兜底：炮塔棋子桌面位置经逆仿射换算（棋子可能不在真实网格位，仅供参考）
         gridPos = default;
-        if (!affineReady) return false;
+        if (!allowPieceFallback || !affineReady) return false;
         var surface = GameObject.Find("Draggable Surface")?.transform;
         var local = fcs?.MapTable.TurretLocalPos();
         if (surface == null || local == null) return false;

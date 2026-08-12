@@ -46,6 +46,8 @@ public class FSC
     public readonly TriggerConsole TriggerConsole = new();
     /// <summary>情报/测绘子系统（自动解析情报、一键揭示全图）。</summary>
     public readonly IntelSystem Intel = new();
+    /// <summary>紧急转移/后勤车队辅助（转移检测、NestGps 作弊直读、卡牌侦察）。</summary>
+    public readonly ConvoyAssist Convoy = new();
     
     // ===== 任务调度 =====
     // 用户不再指定炮管：任务入队后由调度器派给空闲炮管，炮管打完一发自动拉下一个。
@@ -95,6 +97,7 @@ public class FSC
         _turretLock.Reset();
         // 情报系统不依赖场景控件绑定：即使炮塔/控制台没绑上，Survey 的侦察 dump 仍然有用。
         Intel.Bind(this);
+        Convoy.Bind(this, Intel);
         IsBound = MapTable.TryBind()
                   && BallisticCalculator.TryBind()
                   && LeftGun.TryBind("Left")
@@ -115,6 +118,7 @@ public class FSC
     public void Update() {
         _sceneInteractor.Update();
         Intel.Tick();
+        Convoy.Tick();
     }
 
     /// <summary>场景交互器（IntelSystem 创建标记/标签时用其 AddText 与销毁登记）。</summary>
@@ -137,6 +141,7 @@ public class FSC
 
         _sceneInteractor.ShutDown();
         Intel.ShutDown();
+        Convoy.ShutDown();
         try { _harmony?.UnpatchSelf(); }
         catch (Exception ex) { MelonLogger.Error($"[FCS] UnpatchSelf failed: {ex}"); }
         _harmony = null;
