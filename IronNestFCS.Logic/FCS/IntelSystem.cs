@@ -84,6 +84,10 @@ public class IntelSystem {
     // 出现不同的新网格行（后勤车队情报到位）时自动解除。
     private bool turretRelocationPending;
     private Vector2 staleTurretGrid;
+    /// <summary>转移状态对外只读（ConvoyAssist 的自动车队循环据此判断是否继续打卡）。</summary>
+    public bool TurretRelocationPending => turretRelocationPending;
+    /// <summary>最近一次解析到的"铁巢新位置位于X某处"大格公告（自动车队卡参数）。</summary>
+    private string? lastTurretZoneCell;
 
     // 标记物资源（实例字段，ShutDown 清空；静态会钉住旧 ALC）
     private Mesh? ringMesh;
@@ -168,6 +172,7 @@ public class IntelSystem {
         lastIntelHash = "";
         WindowLines.Clear();
         turretRelocationPending = false;
+        lastTurretZoneCell = null;
     }
 
     /// <summary>
@@ -258,6 +263,16 @@ public class IntelSystem {
         RetractStaleAlts();
         SyncCandidates();
         RebuildWindowLines();
+
+        // 自动后勤车队：转移未定位 + 大格已知 + 开关开 → 触发打卡循环（已在跑则忽略）
+        if (turretRelocationPending && fcs != null && fcs.Convoy.AutoConvoy && !fcs.Convoy.NestGps) {
+            if (lastTurretZoneCell != null) {
+                fcs.Convoy.RequestConvoyIntel(lastTurretZoneCell);
+            }
+            else if (full) {
+                MelonLogger.Msg("[Intel] 铁巢已转移但大格公告尚未出现，等报文打印后自动打车队卡");
+            }
+        }
 
         if (full) {
             foreach (var c in Candidates) {
@@ -491,6 +506,61 @@ public class IntelSystem {
                 }
             }
             RegisterAnchorOptions(subject.Name, emitted);
+        }
+
+        // 阶段 2.5：后勤车队（位置报告卡）报文 → 铁巢新位置解算。
+        // 每条报告是对铁巢的一条几何约束（距离圆/方位线，锚点坐标行内自带）；
+        // 唯一解才接受（双解歧义时等更多报告，由 AutoConvoy 继续打卡）；接受后注册为
+        // "铁巢"锚点——TryGetTurretGrid 发现与旧值不同会自动解除转移状态、补摆棋子。
+        string? zoneCell = null;
+        var turretCons = new List<IGeoConstraint>();
+        foreach (var item in doc.Items) {
+            switch (item.Kind) {
+                case "turretZone":
+                    zoneCell = item.AnchorText;
+                    break;
+                case "turretDist":
+                    turretCons.Add(new DistanceCircle {
+                        Center = new Vector2(item.Value2, item.Value3), RadiusKm = item.Value1,
+                        AnchorName = "车队报点",
+                    });
+                    break;
+                case "turretBearing":
+                    turretCons.Add(new BearingLine {
+                        Origin = new Vector2(item.Value2, item.Value3), BearingDeg = item.Value1,
+                        AnchorName = "车队报点",
+                    });
+                    break;
+            }
+        }
+        lastTurretZoneCell = zoneCell ?? lastTurretZoneCell;
+        if (turretRelocationPending && turretCons.Count >= 2) {
+            var solved = GeoSolver.Solve(turretCons);
+            solved.RemoveAll(c => !IsOnMap(c.Point));
+            if (solved.Count == 0) {
+                if (verbose) MelonLogger.Msg("[Intel] 车队情报解算：交点均在图外，等待更多报告");
+            }
+            else {
+                var best = solved[0];
+                // 真歧义 = 存在"分数接近且位置远离"的另一支。车队距离圆常近乎相切，
+                // 会在真解旁边蹭出一簇仅差几十分米的近点——那不算歧义，直接采信最优解。
+                var ambiguous = false;
+                for (var i = 1; i < solved.Count; ++i) {
+                    if (solved[i].Score - best.Score >= GeoSolver.AmbiguityThresholdKm) break;
+                    if (Vector2.Distance(solved[i].Point, best.Point) > 0.5f) { ambiguous = true; break; }
+                }
+                if (ambiguous) {
+                    if (verbose) {
+                        MelonLogger.Msg($"[Intel] 车队情报仍有双解歧义: ({best.Point.x:F2},{best.Point.y:F2}) 等 " +
+                                        $"{solved.Count} 个分支，需要更多报告");
+                    }
+                }
+                else {
+                    RegisterAnchor("铁巢", best.Point);
+                    MelonLogger.Msg($"[Intel] 车队情报解出铁巢新位置: ({best.Point.x:F2},{best.Point.y:F2}) " +
+                                    $"score={best.Score:F3}（{turretCons.Count} 条约束）");
+                }
+            }
         }
 
         // 阶段 3：散条目
@@ -1274,8 +1344,19 @@ public class IntelSystem {
     /// 纸带锚点视为过时并拒绝；出现不同的新网格行时自动解除转移状态。
     /// </summary>
     private bool TryGetTurretGrid(out Vector2 gridPos, bool allowPieceFallback = true) {
-        // NestGps 作弊：TurretController 精确位置，跳过整个情报收集过程
-        if (fcs != null && fcs.Convoy.NestGps && fcs.Convoy.TryGetNestGpsGrid(out gridPos)) return true;
+        // NestGps 作弊：TurretLocationIcon 的世界坐标经逆仿射换算为精确网格位，
+        // 跳过整个情报收集过程（读数越界则拒绝采信，防误放）
+        if (fcs != null && fcs.Convoy.NestGps && affineReady &&
+            fcs.Convoy.TryGetNestGpsWorld(out var nestWorld)) {
+            var g = AffineInverse(nestWorld);
+            if (IsOnMap(g)) {
+                gridPos = g;
+                return true;
+            }
+            if (verbosePass) {
+                MelonLogger.Warning($"[Intel] NestGps 读数换算后越界 ({g.x:F2},{g.y:F2})，拒绝采信");
+            }
+        }
 
         // 报文/笔记本里的"铁巢"网格行
         foreach (var alias in TurretAliases) {

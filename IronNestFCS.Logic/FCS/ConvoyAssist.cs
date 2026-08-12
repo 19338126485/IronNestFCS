@@ -1,3 +1,4 @@
+using System.Collections;
 using Il2Cpp;
 using MelonLoader;
 using UnityEngine;
@@ -7,22 +8,25 @@ namespace IronNestFCS.Logic.FCS;
 
 /// <summary>
 /// 紧急转移 / 后勤车队辅助系统：
-///  - 转移检测：轮询 TurretController（物理炮位）与 TurretLocationIcon（地图图标）的位置，
-///    任一突变即判定铁巢已转移，通知 <see cref="IntelSystem"/> 作废旧炮位锚点
-///    （纸带上出现新的"铁巢"网格行时自动恢复，见 IntelSystem.TryGetTurretGrid）。
-///  - NestGps（作弊开关，默认关）：直接读 TurretController 的精确位置作炮位真值，
-///    跳过后勤车队的信息收集——绕过卡牌经济，与 Reveal 同性质，故默认关闭。
-///  - AutoConvoy（默认开）：转移后情报不足以精确定位铁巢时，自动以"后勤车队"卡牌
-///    按大格参数征集情报。【打牌与报文解析待格式侦察（DumpCardRecon）完成后接线】
+///  - 转移检测：轮询 TurretLocationIcon（地图图标）位置，突变即判定铁巢已转移，
+///    通知 <see cref="IntelSystem"/> 作废旧炮位锚点。
+///    （实测：TurretController.transform.position 恒定不变，不能用作检测或直读；
+///    唯一跟踪真实炮位的对象是 TurretLocationIcon。）
+///  - NestGps（作弊开关，默认关）：直接读 TurretLocationIcon 世界坐标，
+///    由 IntelSystem 逆仿射换算成精确网格位（越界拒绝），跳过情报收集过程。
+///  - AutoConvoy（默认开）：转移后铁巢未定位且大格公告已出现时，自动打"位置报告"卡
+///    （id=LocationReport，控制台参数为 Coordinate 变量：L=列字母 N=行号）征集车队情报，
+///    直到 IntelSystem 解出唯一新炮位（或尝试次数/卡牌耗尽）。
 ///  - <see cref="DumpCardRecon"/>：卡牌 / 征用插槽 / 控制台变量结构侦察 dump。
 ///
-/// 重载安全：不注册 IL2CPP 类型；不持静态 IL2CPP 引用；ShutDown 清空。
+/// 重载安全：不注册 IL2CPP 类型；不持静态 IL2CPP 引用；协程经 FSC.RunTracked 登记；
+/// ShutDown 清空全部引用。
 /// </summary>
 public class ConvoyAssist {
     /// <summary>自动后勤车队征集开关（默认开）。</summary>
     public bool AutoConvoy { get; private set; } = true;
 
-    /// <summary>作弊：直读炮塔精确位置（默认关）。</summary>
+    /// <summary>作弊：直读炮位图标精确位置（默认关）。</summary>
     public bool NestGps { get; private set; }
 
     private FSC? fcs;
@@ -30,10 +34,16 @@ public class ConvoyAssist {
 
     private float nextPollTime;
     private bool hasBaseline;
-    private Vector3 lastTurretPos;
     private Vector3 lastIconPos;
     private TurretLocationIcon? cachedIcon;
     private IntPtr lastMissionPtr;
+
+    // 自动车队循环
+    private bool convoyRunning;
+    private string? exhaustedCell; // 该大格的尝试次数已耗尽：同一 cell 不再自动重试（防反复烧征用点）
+    private const int MaxConvoyAttempts = 4;
+    /// <summary>卡牌入槽的物理目标点（与 PurchaseDeck 买弹药共用同一征用槽位坐标）。</summary>
+    private static readonly Vector3 SlotDropPos = new(6.4814f, -2.4675f, -22.0968f);
 
     public void Bind(FSC fcs, IntelSystem intel) {
         this.fcs = fcs;
@@ -45,6 +55,7 @@ public class ConvoyAssist {
         intel = null;
         cachedIcon = null;
         hasBaseline = false;
+        convoyRunning = false;
         lastMissionPtr = IntPtr.Zero;
     }
 
@@ -68,8 +79,8 @@ public class ConvoyAssist {
     // ================= 转移检测（每秒轮询） =================
 
     private const float PollIntervalSeconds = 1f;
-    /// <summary>位置突变判定阈值。炮塔位置疑为网格公里尺度（侦察确认中），转移必然移动数 km。</summary>
-    private const float MovedThreshold = 0.5f;
+    /// <summary>图标位移判定阈值（世界单位，world/km≈0.2122，0.1 ≈ 0.5km）。转移必然移动数 km。</summary>
+    private const float MovedThreshold = 0.1f;
 
     public void Tick() {
         if (fcs == null || intel == null) return;
@@ -83,60 +94,35 @@ public class ConvoyAssist {
             lastMissionPtr = ptr;
             hasBaseline = false;
             cachedIcon = null;
+            convoyRunning = false;
+            exhaustedCell = null;
         }
         if (fm == null) return;
 
-        Vector3 turretPos = default;
-        var haveTurret = false;
-        try {
-            var tc = TurretController.Instance;
-            if (tc != null) {
-                turretPos = tc.transform.position;
-                haveTurret = true;
-            }
-        }
-        catch { /* 场景切换瞬间 Instance 可能悬空，下秒再试 */ }
+        var icon = FindTurretIcon();
+        if (icon == null) return;
+        Vector3 iconPos;
+        try { iconPos = icon.transform.position; }
+        catch { cachedIcon = null; return; }
 
-        var iconPos = default(Vector3);
-        var haveIcon = false;
-        try {
-            if (cachedIcon == null) {
-                var icons = Object.FindObjectsOfType<TurretLocationIcon>();
-                cachedIcon = icons.Length > 0 ? icons[0] : null;
-            }
-            if (cachedIcon != null) {
-                iconPos = cachedIcon.transform.position;
-                haveIcon = true;
-            }
-        }
-        catch { cachedIcon = null; }
-
-        if (!haveTurret && !haveIcon) return;
         if (!hasBaseline) {
             hasBaseline = true;
-            lastTurretPos = turretPos;
             lastIconPos = iconPos;
-            MelonLogger.Msg($"[Convoy] 炮位基线: TurretController={(haveTurret ? Fmt(turretPos) : "null")} " +
-                            $"Icon={(haveIcon ? Fmt(iconPos) : "null")}");
+            MelonLogger.Msg($"[Convoy] 炮位基线: 图标={Fmt(iconPos)}");
             return;
         }
 
-        var turretMoved = haveTurret && Vector3.Distance(turretPos, lastTurretPos) > MovedThreshold;
-        var iconMoved = haveIcon && Vector3.Distance(iconPos, lastIconPos) > MovedThreshold;
-        if (!turretMoved && !iconMoved) return;
-
-        MelonLogger.Msg($"[Convoy] 检测到铁巢转移: " +
-                        $"{(turretMoved ? $"TurretController {Fmt(lastTurretPos)}→{Fmt(turretPos)} " : "")}" +
-                        $"{(iconMoved ? $"Icon {Fmt(lastIconPos)}→{Fmt(iconPos)}" : "")}");
-        lastTurretPos = turretPos;
+        if (Vector3.Distance(iconPos, lastIconPos) <= MovedThreshold) return;
+        MelonLogger.Msg($"[Convoy] 检测到铁巢转移: 图标 {Fmt(lastIconPos)}→{Fmt(iconPos)}");
         lastIconPos = iconPos;
         intel.OnTurretRelocated();
+    }
 
-        if (AutoConvoy && !NestGps) {
-            // TODO(侦察后接线)：自动找后勤车队卡 → PlaceCard → 设大格参数 → AttemptRequisition。
-            // 大格参数可由 turretPos 向下取整得到（游戏本就免费告知大格，不算作弊）。
-            MelonLogger.Msg("[Convoy] AutoConvoy 已开：自动车队征集将在报文格式侦察完成后启用（当前请先手动打车队卡）");
-        }
+    private TurretLocationIcon? FindTurretIcon() {
+        if (cachedIcon != null) return cachedIcon;
+        var icons = Object.FindObjectsOfType<TurretLocationIcon>();
+        cachedIcon = icons.Length > 0 ? icons[0] : null;
+        return cachedIcon;
     }
 
     private static string Fmt(Vector3 p) => $"({p.x:F2},{p.y:F2},{p.z:F2})";
@@ -144,21 +130,127 @@ public class ConvoyAssist {
     // ================= NestGps 作弊直读 =================
 
     /// <summary>
-    /// 作弊：直接读 TurretController 的精确位置作为炮位网格坐标。
-    /// 仅当读数落在网格公里尺度（0..20 / 0..10）内才采信；范围外说明坐标空间猜错，拒绝并打日志。
+    /// 作弊：读炮位图标的世界坐标（换算/越界校验在 IntelSystem 侧做，那里有仿射校准）。
     /// </summary>
-    public bool TryGetNestGpsGrid(out Vector2 grid) {
-        grid = default;
-        TurretController? tc = null;
-        try { tc = TurretController.Instance; }
+    public bool TryGetNestGpsWorld(out Vector3 world) {
+        world = default;
+        TurretLocationIcon? icon = null;
+        try { icon = FindTurretIcon(); }
         catch { return false; }
-        if (tc == null) return false;
-        var p = tc.transform.position;
-        if (p.x is >= -1f and <= 21f && p.y is >= -1f and <= 11f) {
-            grid = new Vector2(p.x, p.y);
-            return true;
+        if (icon == null) return false;
+        try { world = icon.transform.position; }
+        catch { cachedIcon = null; return false; }
+        return true;
+    }
+
+    // ================= 自动后勤车队（位置报告卡） =================
+
+    /// <summary>IntelSystem 在转移未定位且大格已知时调用。已在跑则忽略（重入安全）。</summary>
+    public void RequestConvoyIntel(string cell) {
+        if (fcs == null || intel == null || convoyRunning) return;
+        if (cell == exhaustedCell) return; // 这个大格已经试过且失败了，不再自动烧征用点
+        convoyRunning = true;
+        fcs.RunTracked(ConvoyRoutine(cell));
+    }
+
+    private IEnumerator ConvoyRoutine(string cell) {
+        try {
+            var letter = cell.Substring(0, 1);
+            if (!int.TryParse(cell.Substring(1), out var row)) {
+                MelonLogger.Error($"[Convoy] 大格编号无法解析: '{cell}'");
+                yield break;
+            }
+            MelonLogger.Msg($"[Convoy] 开始自动车队征集: 参数 {cell}");
+            for (var attempt = 1; attempt <= MaxConvoyAttempts; ++attempt) {
+                if (intel == null || fcs == null) yield break;
+                if (!intel.TurretRelocationPending) {
+                    MelonLogger.Msg("[Convoy] 铁巢新位置已解出，车队征集结束");
+                    yield break;
+                }
+                if (NestGps) yield break; // 作弊直读开着就不需要车队了
+
+                // 找卡与槽
+                var card = FindLocationReportCard();
+                var slot = FindRequisitionSlot();
+                if (card == null || slot == null) {
+                    MelonLogger.Warning($"[Convoy] 未找到位置报告卡或征用槽（card={(card != null)} slot={(slot != null)}），停止");
+                    yield break;
+                }
+                if (slot.HasCard) {
+                    MelonLogger.Msg("[Convoy] 征用槽被占用（玩家正在操作？），本次放弃，等下一轮情报刷新再试");
+                    yield break;
+                }
+
+                // 打卡全程持桌面锁：与买弹药/任务流程互斥（同一台征用设备）
+                yield return fcs.AcquireDeskLock();
+                try {
+                    MelonLogger.Msg($"[Convoy] 第 {attempt}/{MaxConvoyAttempts} 次打卡: {card.CurrentDefinition?.ID} → {cell}");
+                    card.transform.position = SlotDropPos;
+                    var drag = card.GetComponent<DraggableItem>();
+                    if (drag != null) drag.MoveToSlot();
+                    yield return new WaitForSeconds(0.8f);
+
+                    if (slot.CurrentCard == null) {
+                        MelonLogger.Warning("[Convoy] 卡牌未入槽，本次打卡失败");
+                        continue;
+                    }
+                    // 设大格参数：控制台里的 Coordinate 变量（L=列字母, N=行号）
+                    var console = slot.CurrentCardConsole;
+                    var vars = console == null ? null : console.GetComponentsInChildren<PunchcardVariable>();
+                    var coordSet = false;
+                    if (vars != null) {
+                        foreach (var v in vars) {
+                            if (v == null || v.VariableType != PunchcardVariable.VariableTypes.Coordinate) continue;
+                            v.SetCoordinate_GridLocation_L(letter);
+                            v.SetCoordinate_GridLocation_N(row);
+                            coordSet = true;
+                        }
+                    }
+                    if (!coordSet) {
+                        MelonLogger.Warning("[Convoy] 未找到 Coordinate 参数变量，按控制台默认值打卡");
+                    }
+                    yield return new WaitForSeconds(0.2f);
+                    slot.AttemptRequisition();
+                }
+                finally {
+                    fcs.ReleaseDeskLock();
+                }
+
+                // 等电报机打印 + 情报哈希轮询的自动重解析（3s 周期），余量给足
+                yield return new WaitForSeconds(6f);
+                try { intel.Survey(); } // 立即重解析评估：解出则下轮循环自行退出
+                catch (Exception ex) { MelonLogger.Error($"[Convoy] 打卡后重解析失败: {ex.Message}"); }
+            }
+            if (intel != null && intel.TurretRelocationPending) {
+                exhaustedCell = cell;
+                MelonLogger.Warning($"[Convoy] {MaxConvoyAttempts} 次打卡后铁巢仍未定位，停止且不再自动重试 {cell}" +
+                                    "（征用点/卡牌耗尽或报文格式未覆盖）");
+            }
         }
-        return false;
+        finally {
+            convoyRunning = false;
+        }
+    }
+
+    private static PunchcardRuntime? FindLocationReportCard() {
+        foreach (var card in Object.FindObjectsOfType<PunchcardRuntime>()) {
+            if (card == null) continue;
+            try {
+                var def = card.CurrentDefinition;
+                if (def == null) continue;
+                if (def.ID == "LocationReport") return card;
+                var title = card.nameText != null ? card.nameText.text : "";
+                if (!string.IsNullOrEmpty(title) &&
+                    (title.Contains("位置报告") || title.Contains("后勤") || title.Contains("车队"))) return card;
+            }
+            catch { /* 单卡读取失败跳过 */ }
+        }
+        return null;
+    }
+
+    private static RequisitionSlot? FindRequisitionSlot() {
+        var slots = Object.FindObjectsOfType<RequisitionSlot>();
+        return slots.Length > 0 ? slots[0] : null;
     }
 
     // ================= 卡牌侦察 dump =================

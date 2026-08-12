@@ -13,9 +13,10 @@ namespace IronNestFCS.Logic.FCS;
 public sealed class ParsedItem {
     public string RawLine = "";
     public string Kind = "";
-    public string AnchorText = ""; // 锚点名（如 观测员#1），空 = 炮位
+    public string AnchorText = ""; // 锚点名（如 观测员#1），空 = 炮位；turretZone 时存大格编号（如 H4）
     public float Value1;
     public float Value2;
+    public float Value3;           // turretDist/turretBearing：Value1=距离/角度, Value2=报点x, Value3=报点y
     public string? TokenName;      // 行内识别出的棋子类型名
 }
 
@@ -72,6 +73,24 @@ public static class IntelParser {
     // MarkerNoteLogger 默认格式（玩家在地图上拖标尺后自动誊抄）：'Angle: {angle} | Distance: {distance}'
     private static readonly Regex AngleDistance =
         new(@"Angle:\s*([\d.]+)\s*\|\s*Distance:\s*([\d.]+)", RegexOptions.Compiled);
+
+    // ===== 紧急转移 / 后勤车队（位置报告卡）报文，2026-08-12 实测样本 =====
+    // "铁巢新位置位于H4某处" —— 转移完成后告知大格（后勤车队卡的参数）
+    private static readonly Regex TurretZone =
+        new(@"位于\s*(?<cell>[A-Z]\d{1,2})\s*某处", RegexOptions.Compiled);
+    // "测距仪显示我与铁巢相距0.61km：车队#2当前位置：H4 8:4 . . ." —— 距离圆约束（圆心=车队位置）
+    private static readonly Regex ConvoyDistance =
+        new(@"相距\s*(?<dist>[\d.]+)\s*(?:km|公里|千米).*?(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
+            RegexOptions.Compiled);
+    // "车队#3发现铁巢: <风味文本> 180 自 H4 2:7 . . ." —— 方位线约束（起点=报点，结构为"<度> 自 <格>"）
+    private static readonly Regex ConvoyBearing =
+        new(@"(?<deg>\d{1,3})\s*自\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
+            RegexOptions.Compiled);
+
+    /// <summary>裸网格坐标（无名称前缀，如 "H4 2:7"）→ 网格公里坐标，与 GridRef 行同一换算。</summary>
+    private static (float gx, float gy) ParseBareGrid(Match m, string p) => (
+        char.ToUpperInvariant(m.Groups[p + "col"].Value[0]) - 'A' + ParseFloat(m.Groups[p + "sx"].Value) / 10f,
+        ParseFloat(m.Groups[p + "row"].Value) - 1f + ParseFloat(m.Groups[p + "sy"].Value) / 10f);
 
     // 单位类型关键词 → 棋子名。棋子类型实测只有三种：
     // MapToken_Artillery（数字 1-10，FCS 打击目标）、MapToken_RefrencePoint（字母 A-E）、MapToken_Recon（数字 1-10）。
@@ -165,6 +184,38 @@ public static class IntelParser {
                 });
                 continue;
             }
+
+            // ===== 紧急转移 / 后勤车队（位置报告卡）报文 =====
+            // "铁巢新位置位于H4某处"：转移后的大格公告（自动车队卡的参数来源）
+            m = TurretZone.Match(line);
+            if (m.Success) {
+                doc.Items.Add(new ParsedItem {
+                    RawLine = line, Kind = "turretZone", AnchorText = m.Groups["cell"].Value,
+                });
+                continue;
+            }
+            // "测距仪显示我与铁巢相距0.61km：车队#2当前位置：H4 8:4"：铁巢的距离圆约束
+            m = ConvoyDistance.Match(line);
+            if (m.Success) {
+                var (gx, gy) = ParseBareGrid(m, "");
+                doc.Items.Add(new ParsedItem {
+                    RawLine = line, Kind = "turretDist",
+                    Value1 = ParseFloat(m.Groups["dist"].Value), Value2 = gx, Value3 = gy,
+                });
+                continue;
+            }
+            // "车队#3发现铁巢: … 180 自 H4 2:7"：铁巢的方位线约束
+            m = ConvoyBearing.Match(line);
+            if (m.Success) {
+                var (gx, gy) = ParseBareGrid(m, "");
+                doc.Items.Add(new ParsedItem {
+                    RawLine = line, Kind = "turretBearing",
+                    Value1 = ParseFloat(m.Groups["deg"].Value), Value2 = gx, Value3 = gy,
+                });
+                continue;
+            }
+            // "铁巢从I6 5:3转移至未知位置"：转移公告本身无定位价值（检测靠图标位移），静默跳过
+            if (line.Contains("转移至未知位置")) continue;
 
             if (Regex.IsMatch(line, @"\d")) {
                 MelonLogger.Msg($"[Intel] 未能解析的行({sourceTag}): {line}");

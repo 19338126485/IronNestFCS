@@ -226,6 +226,11 @@ public class FSC
         return handle;
     }
 
+    /// <summary>征用台互斥锁（给 ConvoyAssist 自动打卡用）：与弹药采购/任务流程共用同一硬件。</summary>
+    public IEnumerator AcquireDeskLock() => _deskLock.Acquire();
+    /// <summary>释放征用台互斥锁。</summary>
+    public void ReleaseDeskLock() => _deskLock.Release();
+
     /// <summary>炮管打完一发后释放槽位并尝试拉取队列里的下一个任务。</summary>
     private void ReleaseSlot(LeftRight leftRight) {
         if (leftRight == LeftRight.Left) LeftTask = null;
