@@ -19,6 +19,8 @@ public sealed class ParsedItem {
     public float Value3;           // turretDist/turretBearing/foDist/foBearing：Value1=距离/角度, Value2=报点x, Value3=报点y
     public bool Fuzzy;             // 模糊约束（罗盘方位词，±11°）：解算照旧但候选标低置信度
     public string? TokenName;      // 行内识别出的棋子类型名
+    public string? ShellId;        // support：请求弹种（SMK/HE…，即 BulletType 枚举名）
+    public float DeadlineT = -1f;  // support：响应期限（战场时钟秒，与报文 T= 同时钟），-1=无期限
 }
 
 /// <summary>一个情报主题（如"敌方炮兵指挥中心#1:"），其下的"自…"约束都归到它名下。</summary>
@@ -229,6 +231,21 @@ public static class IntelParser {
     private static readonly Regex HighPrioDestroyed =
         new(@"高优先级目标\s*(?<name>.+?)\s*已摧毁", RegexOptions.Compiled);
 
+    // ===== 步兵支援请求（友军报点，2026-08-13 实测样本） =====
+    // "请求在我方阵地 M4 9:2 施放SMK弹，请于 10:12:34之前响应！" → 定点=阵地格（己方阵地上打烟雾）
+    // "请求向方位角 227°、距我方阵地 H7 3:9 0.57km处发射HE弹，请于 10:17:10之前响应…" → 阵地格+方位/距离偏移
+    // 长行会被纸带换行截断："方位角 221°，距我方阵地 K7 0:5 0.89km"（弹种/期限可能丢失，地点仍可解）
+    private static readonly Regex SupportPoint =
+        new(@"请求在我(?:方|军)阵地\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
+            RegexOptions.Compiled);
+    private static readonly Regex SupportOffset =
+        new(@"方位角\s*(?<deg>\d{1,3})\s*°\s*[、，,]\s*距我(?:方|军)阵地\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)\s*(?<dist>[\d.]+)\s*(?:km|公里|千米)",
+            RegexOptions.Compiled);
+    private static readonly Regex SupportShell =
+        new(@"(?<shell>[A-Za-z]{2,5})\s*弹", RegexOptions.Compiled);
+    private static readonly Regex SupportDeadline =
+        new(@"请于\s*(?<h>\d{1,2}):(?<mi>\d{2}):(?<s>\d{2})", RegexOptions.Compiled);
+
     /// <summary>"HH:MM:SS" → 秒（报文 T= 时刻即 MissionStatsTracker.missionTime 的格式化）。</summary>
     private static float Hms(Match m) =>
         ParseFloat(m.Groups["h"].Value) * 3600f + ParseFloat(m.Groups["mi"].Value) * 60f + ParseFloat(m.Groups["s"].Value);
@@ -349,6 +366,38 @@ public static class IntelParser {
                 doc.DestroyedNames.Add(mDestroyed.Groups["name"].Value.Trim());
                 continue;
             }
+
+            // ===== 步兵支援请求（友军报点：阵地格 或 阵地格+方位/距离偏移，解析时直接算出坐标） =====
+            var mSupPt = SupportPoint.Match(line);
+            var mSupOff = SupportOffset.Match(line);
+            if (mSupPt.Success || mSupOff.Success) {
+                float px, py;
+                if (mSupPt.Success) {
+                    (px, py) = ParseBareGrid(mSupPt, "");
+                }
+                else {
+                    var (gx, gy) = ParseBareGrid(mSupOff, "");
+                    var rad = ParseFloat(mSupOff.Groups["deg"].Value) * (float)(Math.PI / 180.0);
+                    var dist = ParseFloat(mSupOff.Groups["dist"].Value);
+                    px = gx + (float)Math.Sin(rad) * dist;
+                    py = gy + (float)Math.Cos(rad) * dist;
+                }
+                string? shell = null;
+                var mshell = SupportShell.Match(line);
+                if (mshell.Success) shell = mshell.Groups["shell"].Value.ToUpperInvariant();
+                var deadline = -1f;
+                var mdl = SupportDeadline.Match(line);
+                if (mdl.Success) deadline = Hms(mdl);
+                doc.Items.Add(new ParsedItem {
+                    RawLine = line, Kind = "support",
+                    Value1 = px, Value2 = py,
+                    TokenName = "MapToken_Artillery",
+                    ShellId = shell, DeadlineT = deadline,
+                });
+                continue;
+            }
+            // 换行截断后独立的期限行（"请于 10:09:14前响应"）：归属难判定，期限丢失无害，静默消费
+            if (line.StartsWith("请于")) continue;
 
             // ===== 活动报告（观测员三角测量） =====
             // 实测结构（截图确认）：与其他报文同一"主题+约束"格式——

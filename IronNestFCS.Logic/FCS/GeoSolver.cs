@@ -67,6 +67,8 @@ public sealed class SurveyCandidate {
     /// 此时报文的整数度舍入会被几何放大成显著的定位漂移——真解可能在交点附近沿约束滑动很远。
     /// </summary>
     public bool LowConfidence;
+    /// <summary>步兵支援请求指定的弹种（BulletType 枚举名，如 SMK/HE）；Fire 时优先于手动选择的弹种。</summary>
+    public string? RequestedShellId;
 }
 
 /// <summary>

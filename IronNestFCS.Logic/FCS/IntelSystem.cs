@@ -707,6 +707,31 @@ public class IntelSystem {
         var loose = new List<IGeoConstraint>();
         foreach (var item in doc.Items) {
             switch (item.Kind) {
+                case "support": {
+                    // 步兵支援请求：坐标解析期已算出（阵地格 / 阵地格+方位距离偏移）。
+                    // 有响应期限且已过期（+30s 宽限）则跳过——过期的呼救只是纸带遗存。
+                    if (item.DeadlineT > 0f && fcs != null) {
+                        var nowT = fcs.Moving.ScenarioNow();
+                        if (nowT > 0f && nowT > item.DeadlineT + 30f) {
+                            if (verbose) MelonLogger.Msg($"[Intel] 支援请求已过响应期限，跳过: {item.RawLine}");
+                            break;
+                        }
+                    }
+                    var pt = new Vector2(item.Value1, item.Value2);
+                    if (!IsOnMap(pt)) {
+                        if (verbose) MelonLogger.Msg($"[Intel] 支援请求落点在图外，跳过: {item.RawLine}");
+                        break;
+                    }
+                    results.Add(new SurveyCandidate {
+                        Name = $"支援{item.ShellId ?? "?"}@{ZoneName(pt)}",
+                        Point = pt,
+                        Score = 0f,
+                        Basis = $"步兵支援请求: {item.RawLine}",
+                        TokenName = item.TokenName,
+                        RequestedShellId = item.ShellId,
+                    });
+                    break;
+                }
                 case "angleDist": {
                     if (!TryGetTurretGrid(out var origin)) {
                         MelonLogger.Warning("[Intel] angleDist 条目需要炮位锚点，但炮位未知");
@@ -1050,14 +1075,21 @@ public class IntelSystem {
         var dist = delta.magnitude * 3.8164f;
         var angle = Vector3.SignedAngle(delta, Vector3.up, Vector3.forward);
         if (angle < 0) angle += 360;
+        // 步兵支援请求自带弹种（SMK 掩护/HE 杀伤等）：优先于手动选择的弹种
+        var bullet = fcs.Interactor.selectedBulletType;
+        if (!string.IsNullOrEmpty(e.Cand.RequestedShellId) &&
+            Enum.TryParse<BulletType>(e.Cand.RequestedShellId, out var requested)) {
+            bullet = requested;
+        }
         var task = new ArtilleryTask {
             targetId = e.Seq,
             angel = angle,
             distance = dist,
             position = new Vector3(e.Cand.Point.x, e.Cand.Point.y, 0f),
-            bulletType = fcs.Interactor.selectedBulletType,
+            bulletType = bullet,
         };
-        MelonLogger.Msg($"[Intel] 直接开火 #{e.Seq}: [{e.Cand.Name}] {angle:F1}°/{dist:F2}km {task.bulletType}");
+        MelonLogger.Msg($"[Intel] 直接开火 #{e.Seq}: [{e.Cand.Name}] {angle:F1}°/{dist:F2}km {task.bulletType}" +
+                        (bullet != fcs.Interactor.selectedBulletType ? "（按请求弹种）" : ""));
         fcs.EnqueueTask(task);
         // 自动切到下一个待处理候选，便于连续点名
         if (Candidates.Count > 1) {
