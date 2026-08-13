@@ -531,7 +531,12 @@ public class IntelSystem {
             }
 
             var best = merged[0];
-            best.Name = subject.Name;
+            // 活动报告没有名字：按落点所在大格命名（实测汇总行会错配，落点大格才是可靠标签，
+            // 与游戏自己的"报告活动于坐标 X"叫法自然吻合）
+            var subjectName = subject.Name == "活动报告"
+                ? $"活动@{ZoneName(best.Point)}"
+                : subject.Name;
+            best.Name = subjectName;
             best.TokenName ??= subject.TokenName;
             results.Add(best);
             var emitted = new List<Vector2> { best.Point };
@@ -546,7 +551,7 @@ public class IntelSystem {
                     break;
                 }
                 var alt = merged[i];
-                alt.Name = subject.Name + (altCount == 0 ? "(alt)" : $"(alt{altCount + 1})");
+                alt.Name = subjectName + (altCount == 0 ? "(alt)" : $"(alt{altCount + 1})");
                 alt.TokenName ??= subject.TokenName;
                 results.Add(alt);
                 emitted.Add(alt.Point);
@@ -556,7 +561,7 @@ public class IntelSystem {
                                     $"备选 ({alt.Point.x:F2},{alt.Point.y:F2}) score={alt.Score:F3}");
                 }
             }
-            RegisterAnchorOptions(subject.Name, emitted);
+            RegisterAnchorOptions(subjectName, emitted);
         }
 
         // 阶段 2.6：前线观测员（Spotter 卡）报告独立解算——没有同名主题可并入的敌军组。
@@ -721,6 +726,13 @@ public class IntelSystem {
     // 地图边界（km）：全任务地图 20×10（列 A–T、行 1–10），留 0.5km 边距。
     private static bool IsOnMap(Vector2 p) =>
         p.x is >= -0.5f and <= 20.5f && p.y is >= -0.5f and <= 10.5f;
+
+    /// <summary>网格坐标 → 大格名（如 (6.6,4.85) → G5），活动报告命名用。</summary>
+    private static string ZoneName(Vector2 p) {
+        var col = Mathf.Clamp(Mathf.FloorToInt(p.x), 0, 25);
+        var row = Mathf.Max(1, Mathf.FloorToInt(p.y) + 1);
+        return $"{(char)('A' + col)}{row}";
+    }
 
     /// <summary>
     /// 把本次解算结果同步进登记簿：同名条目原地更新（保留 已落子/已忽略 状态），

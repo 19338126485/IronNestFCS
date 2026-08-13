@@ -145,7 +145,12 @@ public static class GeoSolver {
                 foreach (var p in IntersectPair(constraints[i], constraints[j])) {
                     if (ExistsNear(res, p)) continue;
                     var score = 0f;
-                    foreach (var c in constraints) score += c.Residual(p);
+                    // 模糊约束（罗盘方位词）只产生交点、不参与投票：±11° 的误差在远距离
+                    // 会贡献公里级残差，把精确约束的 0 残差淹没、把排序绑架（2026-08-13 实测）。
+                    foreach (var c in constraints) {
+                        if (c is BearingLine { Fuzzy: true }) continue;
+                        score += c.Residual(p);
+                    }
                     res.Add(new SurveyCandidate {
                         Point = p,
                         Score = score,

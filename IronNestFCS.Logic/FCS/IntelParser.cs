@@ -112,13 +112,16 @@ public static class IntelParser {
     private static readonly Regex ActivityCompass =
         new(@"^(?<anchor>[^\s：:]+)：\s*(?<dir>[北东南西偏]+)\s*$", RegexOptions.Compiled);
 
-    /// <summary>中文十六向罗盘词 → 方位角（罗盘约定：0=北，顺时针）。偏词两种写法都收（西偏北/西北偏西）。</summary>
+    /// <summary>中文十六向罗盘词 → 方位角（罗盘约定：0=北，顺时针）。两种偏词写法全收（西偏北/西北偏西、西南偏西等）。</summary>
     private static readonly (string word, float deg)[] CompassWords = {
-        ("北偏东", 22.5f), ("东北", 45f), ("东偏北", 67.5f), ("东", 90f),
-        ("东偏南", 112.5f), ("东南", 135f), ("南偏东", 157.5f), ("南", 180f),
-        ("南偏西", 202.5f), ("西南", 225f), ("西偏南", 247.5f), ("西", 270f),
-        ("西偏北", 292.5f), ("西北偏西", 292.5f), ("西北", 315f), ("北偏西", 337.5f),
-        ("北", 0f),
+        ("北", 0f), ("北偏东", 22.5f), ("东北偏北", 22.5f),
+        ("东北", 45f), ("东偏北", 67.5f), ("东北偏东", 67.5f),
+        ("东", 90f), ("东偏南", 112.5f), ("东南偏东", 112.5f),
+        ("东南", 135f), ("南偏东", 157.5f), ("东南偏南", 157.5f),
+        ("南", 180f), ("南偏西", 202.5f), ("西南偏南", 202.5f),
+        ("西南", 225f), ("西偏南", 247.5f), ("西南偏西", 247.5f),
+        ("西", 270f), ("西偏北", 292.5f), ("西北偏西", 292.5f),
+        ("西北", 315f), ("北偏西", 337.5f), ("西北偏北", 337.5f),
     };
 
     // "车队#3发现铁巢: <风味文本> 180 自 H4 2:7 . . ." —— 方位线约束（起点=报点，结构为"<度> 自 <格>"）
@@ -156,20 +159,19 @@ public static class IntelParser {
         if (string.IsNullOrWhiteSpace(text)) return doc;
 
         IntelSubject? current = null;
-        List<ParsedItem>? activityBlock = null;  // 活动报告的连续测量行（归属最近的 pendingCell）
-        string? pendingCell = null;
+        List<ParsedItem>? activityBlock = null;  // 活动报告的连续测量行
 
-        // 测量块收尾：汇成一个主题（命名用 pendingCell，无则匿名）
+        // 测量块收尾：汇成一个匿名主题（命名在解算后按落点大格生成，见 IntelSystem；
+        // 汇总行只做块分隔——实测它与测量块的对应关系会错配，不可信）。
         void FlushActivity() {
             if (activityBlock == null) return;
             var subject = new IntelSubject {
-                Name = pendingCell != null ? $"活动@{pendingCell}" : "活动报告",
+                Name = "活动报告",
                 TokenName = "MapToken_Artillery",
             };
             subject.Constraints.AddRange(activityBlock);
             doc.Subjects.Add(subject);
             activityBlock = null;
-            pendingCell = null;
         }
 
         // 加入一行测量。同一锚点在块内重复 = 新一轮测量（每批每个观测员恰好一行），先收尾再开新块。
@@ -187,11 +189,10 @@ public static class IntelParser {
             if (line.Length == 0 || line == "." || line == "- - -") continue;
 
             // ===== 活动报告（观测员三角测量） =====
-            // 汇总行："报告活动于坐标 B10"（归属给解析顺序中紧随其后的测量块）
+            // 汇总行："报告活动于坐标 B10"（只做测量块的分隔符，不参与命名）
             var mAct = ActivityHeader.Match(line);
             if (mAct.Success) {
                 FlushActivity();
-                pendingCell = mAct.Groups["cell"].Value;
                 continue;
             }
             // 测量行：距离 / 方位角 / 罗盘方位词（模糊）
