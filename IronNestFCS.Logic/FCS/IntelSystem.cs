@@ -89,6 +89,14 @@ public class IntelSystem {
     private bool turretAnchorFromConvoy;
     /// <summary>纸带上最新的大格公告（自动车队卡参数来源，每次 Survey 重读）。</summary>
     private string? lastTurretZoneCell;
+    /// <summary>本轮 Survey 纸带上的大格公告总条数（新公告检测用）。</summary>
+    private int lastZoneItemCount;
+    /// <summary>检测到转移那一刻的公告条数快照：超过它 = 新公告已打印，才允许打卡。</summary>
+    private int zoneCountAtDetect;
+    /// <summary>本轮转移的新大格公告已打印（BuildCandidateResults 写入，车队触发读取）。</summary>
+    private bool newZoneAnnounced;
+    /// <summary>转移轮次：每次检测到转移 +1，用于中止仍在跑的旧一轮车队打卡协程。</summary>
+    public int RelocEpoch { get; private set; }
     /// <summary>出现过的车队报告行（原文去重）：区分新旧情报的唯一可靠依据。</summary>
     private readonly HashSet<string> seenConvoyLines = new();
     /// <summary>本轮转移累积的车队约束（每次转移清空，跨 Survey 累积）。</summary>
@@ -181,6 +189,9 @@ public class IntelSystem {
         turretAnchorFromConvoy = false;
         seenConvoyLines.Clear();
         pendingConvoyCons.Clear();
+        lastZoneItemCount = 0;
+        zoneCountAtDetect = 0;
+        newZoneAnnounced = false;
     }
 
     /// <summary>
@@ -191,8 +202,11 @@ public class IntelSystem {
         pendingConvoyCons.Clear();
         turretAnchorFromConvoy = false;
         turretRelocationPending = true;
+        zoneCountAtDetect = lastZoneItemCount; // 新公告条数必须超过此快照才允许打卡
+        newZoneAnnounced = false;
+        RelocEpoch++;
         fcs?.Convoy.OnRelocationEpoch(); // 新一轮：重置车队卡的"失败不再重试"记录
-        MelonLogger.Msg("[Intel] 铁巢已转移：旧炮位锚点作废，等待车队新报告（纸带最新大格将用作车队卡参数）");
+        MelonLogger.Msg("[Intel] 铁巢已转移：旧炮位锚点作废，等待新大格公告（公告打印后才打车队卡）");
         Survey(full: false);
     }
 
@@ -274,13 +288,14 @@ public class IntelSystem {
         SyncCandidates();
         RebuildWindowLines();
 
-        // 自动后勤车队：转移未定位 + 大格已知 + 开关开 → 触发打卡循环（已在跑则忽略）
+        // 自动后勤车队：转移未定位 + 新大格公告已打印 + 开关开 → 触发打卡循环（已在跑则忽略）。
+        // 公告未打印前不打卡（实测：公告未出就用旧大格打卡，得到的全是旧信息）。
         if (turretRelocationPending && fcs != null && fcs.Convoy.AutoConvoy && !fcs.Convoy.NestGps) {
-            if (lastTurretZoneCell != null) {
-                fcs.Convoy.RequestConvoyIntel(lastTurretZoneCell);
+            if (newZoneAnnounced && lastTurretZoneCell != null) {
+                fcs.Convoy.RequestConvoyIntel(lastTurretZoneCell, RelocEpoch);
             }
-            else if (full) {
-                MelonLogger.Msg("[Intel] 铁巢已转移但大格公告尚未出现，等报文打印后自动打车队卡");
+            else if (full && !newZoneAnnounced) {
+                MelonLogger.Msg("[Intel] 等待新大格公告打印，之后自动打车队卡");
             }
         }
 
@@ -586,17 +601,21 @@ public class IntelSystem {
         // 每条报告是对铁巢的一条几何约束（距离圆/方位线，锚点坐标行内自带）；
         // 唯一解才接受（双解歧义时等更多报告，由 AutoConvoy 继续打卡）。
         //
-        // 新旧情报分界（2026-08-13 两次实测教训）：
-        //  - 纸带是【倒序】的（新行在上），靠行位置区分新旧不可行；
-        //  - 同一任务可能多次转移到【同一大格】（公告文本不变），靠公告变化区分也不可行；
-        //  - 唯一可靠的分界是"这一行以前见过没有"：seenConvoyLines 登记所有出现过的
-        //    报告行，转移待定期间只把首次出现的行累积进本轮约束（pendingConvoyCons，
-        //    每次转移清空）。上一轮的报告行早已被登记，自然被排除。
+        // 新旧情报分界（2026-08-13 三次实测教训）：
+        //  - 纸带是【倒序】的（新行在上）：最新大格公告 = 第一条 turretZone 条目；
+        //  - 同一任务可能多次转移到【同一大格】（公告文本逐字相同），靠文本变化区分不可行，
+        //    但公告【条数】会 +1——计数是区分"新公告是否已打印"的唯一可靠信号；
+        //  - 报告行靠 seenConvoyLines 去重：转移待定期间只累积首次出现的行。
+        //  - 打卡时机：新公告【条数】超过检测到转移时的快照才允许打卡（用户实测：
+        //    公告未出就用旧大格打卡，得到的全是旧信息）。
         var turretCons = pendingConvoyCons; // 本轮转移的累积约束（跨 Survey 保留）
         var fresh = 0;
+        var zoneItemCount = 0;
+        string? newestZoneCell = null;
         foreach (var item in doc.Items) {
             if (item.Kind == "turretZone") {
-                lastTurretZoneCell = item.AnchorText; // 纸带上最新的大格公告 = 车队卡参数
+                zoneItemCount++;
+                newestZoneCell ??= item.AnchorText; // 纸带倒序：第一条即最新公告
                 continue;
             }
             IGeoConstraint? c = item.Kind switch {
@@ -620,6 +639,11 @@ public class IntelSystem {
         if (verbose && fresh > 0) {
             MelonLogger.Msg($"[Intel] 新增 {fresh} 条车队报告（本轮累计 {turretCons.Count} 条约束）");
         }
+        lastZoneItemCount = zoneItemCount;
+        if (newestZoneCell != null) lastTurretZoneCell = newestZoneCell;
+        if (zoneCountAtDetect > zoneItemCount) zoneCountAtDetect = zoneItemCount; // 纸带滚出兜底
+        // 本轮转移的新大格公告是否已打印（打卡时机闸门，供 Survey 末尾的车队触发用）
+        newZoneAnnounced = zoneItemCount > zoneCountAtDetect;
 
         if (turretRelocationPending && turretCons.Count >= 2) {
             var solved = GeoSolver.Solve(turretCons);

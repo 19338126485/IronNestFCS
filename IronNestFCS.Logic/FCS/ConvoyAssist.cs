@@ -163,15 +163,15 @@ public class ConvoyAssist {
         exhaustedCell = null;
     }
 
-    /// <summary>IntelSystem 在转移未定位且大格已知时调用。已在跑则忽略（重入安全）。</summary>
-    public void RequestConvoyIntel(string cell) {
+    /// <summary>IntelSystem 在转移未定位且新大格公告已打印时调用。已在跑则忽略（重入安全）。</summary>
+    public void RequestConvoyIntel(string cell, int epoch) {
         if (fcs == null || intel == null || convoyRunning) return;
         if (cell == exhaustedCell) return; // 这个大格已经试过且失败了，不再自动烧征用点
         convoyRunning = true;
-        fcs.RunTracked(ConvoyRoutine(cell));
+        fcs.RunTracked(ConvoyRoutine(cell, epoch));
     }
 
-    private IEnumerator ConvoyRoutine(string cell) {
+    private IEnumerator ConvoyRoutine(string cell, int epoch) {
         try {
             var letter = cell.Substring(0, 1);
             if (!int.TryParse(cell.Substring(1), out var row)) {
@@ -181,6 +181,11 @@ public class ConvoyAssist {
             MelonLogger.Msg($"[Convoy] 开始自动车队征集: 参数 {cell}");
             for (var attempt = 1; attempt <= MaxConvoyAttempts; ++attempt) {
                 if (intel == null || fcs == null) yield break;
+                if (intel.RelocEpoch != epoch) {
+                    // 打卡途中又转移了：本次征集的情报已过期，作废但不记失败（新一轮会重新触发）
+                    MelonLogger.Msg("[Convoy] 检测到新一轮转移，本次征集作废（不记失败）");
+                    yield break;
+                }
                 if (!intel.TurretRelocationPending) {
                     MelonLogger.Msg("[Convoy] 铁巢新位置已解出，车队征集结束");
                     yield break;
