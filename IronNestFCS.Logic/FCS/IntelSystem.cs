@@ -87,6 +87,9 @@ public class IntelSystem {
     public bool TurretRelocationPending => turretRelocationPending;
     /// <summary>车队情报已解出本轮新炮位（转移期间唯一可信的锚点来源）。</summary>
     private bool turretAnchorFromConvoy;
+    /// <summary>车队解出的炮位（跨 Survey 持久化；纸带上的旧"铁巢"网格行不得将其覆盖，
+    /// 否则确认后下一次 Survey 锚点回落、棋子被拽回旧位——2026-08-13 实测确诊）。</summary>
+    private Vector2? convoyTurretGrid;
     /// <summary>纸带上最新的大格公告（自动车队卡参数来源，每次 Survey 重读）。</summary>
     private string? lastTurretZoneCell;
     /// <summary>本轮 Survey 纸带上的大格公告总条数（新公告检测用）。</summary>
@@ -187,6 +190,7 @@ public class IntelSystem {
         turretRelocationPending = false;
         lastTurretZoneCell = null;
         turretAnchorFromConvoy = false;
+        convoyTurretGrid = null;
         seenConvoyLines.Clear();
         pendingConvoyCons.Clear();
         lastZoneItemCount = 0;
@@ -200,6 +204,7 @@ public class IntelSystem {
     /// </summary>
     public void OnTurretRelocated() {
         pendingConvoyCons.Clear();
+        convoyTurretGrid = null; // 新一轮转移：旧车队解作废
         turretAnchorFromConvoy = false;
         turretRelocationPending = true;
         zoneCountAtDetect = lastZoneItemCount; // 新公告条数必须超过此快照才允许打卡
@@ -687,6 +692,7 @@ public class IntelSystem {
                 }
                 else {
                     RegisterAnchor("铁巢", best.Point);
+                    convoyTurretGrid = best.Point; // 跨 Survey 持久化，防旧网格行覆盖
                     turretAnchorFromConvoy = true; // 唯一可信的新炮位来源，TryGetTurretGrid 据此解除转移
                     MelonLogger.Msg($"[Intel] 车队情报解出铁巢新位置: ({best.Point.x:F2},{best.Point.y:F2}) " +
                                     $"score={best.Score:F3}（{turretCons.Count} 条约束）");
@@ -1489,6 +1495,16 @@ public class IntelSystem {
             }
         }
 
+        // 车队解出的炮位（本轮转移持久化）：优先于纸带上的一切"铁巢"网格行
+        if (convoyTurretGrid.HasValue) {
+            gridPos = convoyTurretGrid.Value;
+            if (turretRelocationPending) {
+                turretRelocationPending = false;
+                MelonLogger.Msg($"[Intel] 铁巢新位置已确认: ({gridPos.x:F2},{gridPos.y:F2})，转移状态解除");
+            }
+            return true;
+        }
+
         // 报文/笔记本里的"铁巢"网格行
         foreach (var alias in TurretAliases) {
             if (!anchors.TryGetValue(alias, out gridPos)) continue;
@@ -1496,10 +1512,6 @@ public class IntelSystem {
                 // 转移待定且车队尚未解出：纸带上的一切"铁巢"锚点都是上一轮的陈旧情报
                 gridPos = default;
                 return false;
-            }
-            if (turretRelocationPending) {
-                turretRelocationPending = false;
-                MelonLogger.Msg($"[Intel] 铁巢新位置已确认: ({gridPos.x:F2},{gridPos.y:F2})，转移状态解除");
             }
             return true;
         }
