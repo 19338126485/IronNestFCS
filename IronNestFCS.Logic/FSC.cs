@@ -402,9 +402,12 @@ public class FSC
     /// <summary>
     /// 定时开火的待机循环：持续读 战场时钟 与 预测飞行时间（含 fireDelay），
     /// 到 命中时刻 − 飞行时间 返回（调用方立即击发）。轮询间隔随剩余时间减半逼近，
-    /// 末段精度 ~0.05s。飞行时间读数无效（0）时退化为按预定时刻直接击发并告警。
+    /// 末段精度 ~0.05s。飞行时间读数会锁存：PredictedImpactTime 在长时间待机会被游戏
+    /// 清零（2026-08-13 实测：待机 3 分钟后读数变 0），射击诸元不变则飞行时间不变，
+    /// 故读到正数就锁存，读数为 0 时沿用锁存值；从未读到有效值才退化为按时刻直接打。
     /// </summary>
     private IEnumerator WaitForStrikeMoment(GunSystem gunSys, ArtilleryTask task) {
+        var latchedFlight = 0f;
         var logged = false;
         var zeroFlightWarned = false;
         while (true) {
@@ -413,7 +416,9 @@ public class FSC
                 MelonLogger.Error("[FCS] 定时开火：任务时钟丢失，立即击发");
                 yield break;
             }
-            var flight = gunSys.PredictedFlightSeconds();
+            var read = gunSys.PredictedFlightSeconds();
+            if (read > 0f) latchedFlight = read;
+            var flight = latchedFlight;
             var remain = task.strikeTime - now;
             if (!logged) {
                 MelonLogger.Msg($"[FCS] 定时开火待机: {task.strikeLabel} 剩余 {remain:F1}s 飞行时间 {flight:F1}s");
@@ -424,7 +429,7 @@ public class FSC
             }
             else {
                 if (!zeroFlightWarned) {
-                    MelonLogger.Warning("[FCS] 定时开火：飞行时间读数为 0（预测未就绪？），将按预定时刻直接击发");
+                    MelonLogger.Warning("[FCS] 定时开火：飞行时间从未读到有效值，将按预定时刻直接击发");
                     zeroFlightWarned = true;
                 }
                 if (remain <= 0.2f) yield break;

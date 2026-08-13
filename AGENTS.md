@@ -51,8 +51,9 @@
 
 - `MovingTargets.cs`：列车（总站+轨道方位角+时刻表拟合匀速）与舰船（目击点+航向+航速节）
   的行进路线推算，登记为自动推进位置的候选（»前缀、青色标记环，每秒重算，图外隐藏）。
-- **游戏时钟 = `MissionStatsTracker.Instance.mission.missionTime`（秒）**：报文 T= 时刻就是
-  `[TIMER <MissionTime>]` 打印的它。ClockCheck 会对每个事件行打"打印延迟"日志校验此假设。
+- **游戏时钟 = `FireMission.RunningTimers["MissionTime"].CurrentSeconds`**（[TIMER] token 数据源）。
+  兜底 `MissionStatsTracker.missionTime`（**从 0 起算**，不是报文时钟！）+ 事件行自学习偏移
+  （默认 36000 = 10:00:00 开局）。ClockCheck 日志校验打印延迟。
 - **飞行时间 = `GunController.PredictedImpactTime + fireDelay`**（调炮后自动更新，手表同源）。
 - 对移动目标按 Fire = 定时开火：打击时刻 = max(now+150s 装填预算, 进图时刻)，钳在可交战
   窗口内；任务装填调炮完成后待机（`Progress.AwaitingStrikeTime`），到 命中时刻−飞行时间

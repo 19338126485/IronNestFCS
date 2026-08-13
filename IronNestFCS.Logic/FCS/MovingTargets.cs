@@ -11,8 +11,9 @@ namespace IronNestFCS.Logic.FCS;
 ///    提供实测位置+时刻，作为最新参考点精化。
 ///  - 舰船：目击报告（时刻+经过点+航向+航速节）直接确定 p(t) = p0 + dir(航向) × v × (t-t0)。
 ///
-/// 游戏时钟：报文 T= 时刻是 [TIMER &lt;MissionTime&gt;] 打印的 MissionStatsTracker.missionTime
-/// （秒）的 HH:MM:SS 格式，故"现在"= MissionStatsTracker.Instance.mission.missionTime。
+/// 游戏时钟：报文 T= 时刻来自 [TIMER &lt;MissionTime&gt;] token，其数据源是
+/// FireMission.RunningTimers["MissionTime"].CurrentSeconds（权威，首选）。
+/// 兜底：MissionStatsTracker.missionTime（从 0 起算）+ 自学习偏移（默认 36000 = 10:00:00 开局）。
 /// </summary>
 public sealed class MovingTrack {
     public string Key = "";          // 登记簿 key（"列车→穆拉谷地总站" / 船名）
@@ -89,6 +90,11 @@ public class MovingTargetSystem {
     private readonly Dictionary<string, MovingTrack> tracks = new();
     /// <summary>已做过时钟校验日志的事件（passage/目击的时刻），避免每次 Survey 重复打印。</summary>
     private readonly HashSet<string> clockChecked = new();
+    /// <summary>兜底时钟偏移（报文T=时刻 − missionTime）：默认 36000（10:00:00 开局，两关实测均为此），
+    /// 首个事件行出现后按 事件T−missionTime 的最大观测值自学习（打印延迟只会把观测值拉低）。</summary>
+    private float clockOffset = 36000f;
+    private bool clockOffsetLearned;
+    private bool timerDumped;
 
     public void Bind(FSC fcs, IntelSystem intel) {
         this.fcs = fcs;
@@ -106,18 +112,53 @@ public class MovingTargetSystem {
     public void ResetMission() {
         tracks.Clear();
         clockChecked.Clear();
+        clockOffset = 36000f;
+        clockOffsetLearned = false;
+        timerDumped = false;
     }
 
-    /// <summary>当前战场时间（秒，与报文 T= 时刻同一时钟）；&lt;0 = 时钟不可用。</summary>
+    /// <summary>
+    /// 当前战场时间（秒，与报文 T= 时刻同一时钟）；&lt;0 = 时钟不可用。
+    /// 首选 FireMission.RunningTimers["MissionTime"]（[TIMER] token 的数据源本身，权威）；
+    /// 兜底 MissionStatsTracker.missionTime（从 0 计的任务经过时间）+ clockOffset。
+    /// 2026-08-13 实测教训：missionTime 从 0 起算而报文 T= 从 10:00:00 起算，
+    /// 直接拿 missionTime 当时钟会把打击点推到图外 370km。
+    /// </summary>
     public float ScenarioNow() {
         try {
+            var fm = FireMission.Instance;
+            if (fm != null && fm.RunningTimers != null &&
+                fm.RunningTimers.TryGetValue("MissionTime", out var tv) && tv != null) {
+                return tv.CurrentSeconds;
+            }
             var inst = MissionStatsTracker.Instance;
             if (inst == null || inst.mission == null) return -1f;
-            return inst.mission.missionTime;
+            return inst.mission.missionTime + clockOffset;
         }
         catch (Exception ex) {
             MelonLogger.Error($"[Moving] 读取任务时钟失败: {ex.Message}");
             return -1f;
+        }
+    }
+
+    /// <summary>首次 Ingest 时 dump 全部 RunningTimers（验证 MissionTime 计时器的存在与读数）。</summary>
+    private void DumpTimersOnce() {
+        if (timerDumped) return;
+        try {
+            var fm = FireMission.Instance;
+            if (fm == null || fm.RunningTimers == null) return;
+            timerDumped = true;
+            foreach (var kv in fm.RunningTimers) {
+                var tv = kv.Value;
+                MelonLogger.Msg($"[Moving] RunningTimer '{kv.Key}': Current={tv?.CurrentSeconds:F1} " +
+                                $"Initial={tv?.InitialSeconds:F1} StartedAt={tv?.StartedAt:F1}");
+            }
+            var inst = MissionStatsTracker.Instance;
+            MelonLogger.Msg($"[Moving] 对照: missionTime={(inst != null && inst.mission != null ? inst.mission.missionTime : -1):F1} " +
+                            $"clockOffset={clockOffset:F0}");
+        }
+        catch (Exception ex) {
+            MelonLogger.Error($"[Moving] dump timers 失败: {ex.Message}");
         }
     }
 
@@ -130,6 +171,7 @@ public class MovingTargetSystem {
 
     public void Ingest(IntelDocument doc, bool verbose) {
         if (intel == null) return;
+        DumpTimersOnce();
         var now = ScenarioNow();
 
         // 损毁除名（"已确认摧毁 <名称>"）
@@ -185,7 +227,7 @@ public class MovingTargetSystem {
             var rel = new Vector2(p.gx, p.gy) - station;
             var d = rel.x * dir.x + rel.y * dir.y;
             if (d > 0.05f) samples.Add((p.t, d)); // 在轨道射线前方才有效
-            ClockCheck($"passage:{p.name}:{p.t}", p.t, now);
+            ClockCheck($"passage:{p.name}:{p.t}", p.t);
         }
         if (raw.ArrivalT > 0f) samples.Add((raw.ArrivalT, 0f)); // 到站时刻 = 距站 0
         if (samples.Count < 2) {
@@ -250,7 +292,7 @@ public class MovingTargetSystem {
         var key = s.Name;
         if (tracks.TryGetValue(key, out var old) && old.SightT >= s.T - 0.5f) return; // 旧报告（纸带重印）
 
-        ClockCheck($"ship:{s.Name}:{s.T}", s.T, now);
+        ClockCheck($"ship:{s.Name}:{s.T}", s.T);
         var track = new MovingTrack {
             Key = key,
             DisplayName = s.Name,
@@ -268,14 +310,32 @@ public class MovingTargetSystem {
     }
 
     /// <summary>
-    /// 时钟校验：事件行（时刻 T）首次出现时记录 当前missionTime − T。
-    /// 预期为小的正值（打印队列延迟，几秒量级）；若系统性巨大偏移说明
-    /// MissionTime 与报文 T= 不是同一时钟，需要回头校准。
+    /// 时钟校验/自学习：事件行（时刻 T，打印于事件发生当下）首次出现时对照当前时钟。
+    /// RunningTimers 可用时：打 漂移=当前时钟−T 日志（预期小的正值=打印延迟，大了说明时钟错）。
+    /// 只能靠兜底时钟时：用 事件T−missionTime 的最大观测值学习 clockOffset。
     /// </summary>
-    private void ClockCheck(string eventKey, float eventT, float now) {
-        if (now < 0f || !clockChecked.Add(eventKey)) return;
-        MelonLogger.Msg($"[Moving] 时钟校验: 事件T={FormatT(eventT)} 首次见于 missionTime={FormatT(now)} " +
-                        $"(打印延迟 {now - eventT:F1}s)");
+    private void ClockCheck(string eventKey, float eventT) {
+        if (!clockChecked.Add(eventKey)) return;
+        try {
+            var fm = FireMission.Instance;
+            if (fm != null && fm.RunningTimers != null &&
+                fm.RunningTimers.TryGetValue("MissionTime", out var tv) && tv != null) {
+                MelonLogger.Msg($"[Moving] 时钟校验: 事件T={FormatT(eventT)} 首次见于时钟={FormatT(tv.CurrentSeconds)} " +
+                                $"(打印延迟 {tv.CurrentSeconds - eventT:F1}s)");
+                return;
+            }
+            var inst = MissionStatsTracker.Instance;
+            if (inst == null || inst.mission == null) return;
+            var obs = eventT - inst.mission.missionTime;
+            if (!clockOffsetLearned || obs > clockOffset) {
+                clockOffset = obs;
+                clockOffsetLearned = true;
+                MelonLogger.Msg($"[Moving] 时钟自学习: 事件T={FormatT(eventT)} → clockOffset={clockOffset:F0}s");
+            }
+        }
+        catch (Exception ex) {
+            MelonLogger.Error($"[Moving] 时钟校验失败: {ex.Message}");
+        }
     }
 
     // ================= 定时开火 =================
@@ -299,6 +359,12 @@ public class MovingTargetSystem {
         var tEnd = track.LatestEngageTime(now) - 5f; // 留 5s 余量，别卡着到站/出图瞬间
         var tEnter = FirstOnMapTime(track, now, tEnd);
         var ts = Mathf.Max(now + MinPrepSeconds, tEnter + 5f);
+        if (ts - now > 600f) {
+            // 目标还没进入交战窗口：挂起一门炮等十几分钟不划算，等它接近再按 Fire
+            MelonLogger.Msg($"[Moving] [{track.DisplayName}] 尚未进入交战窗口（最早打击时刻 {FormatT(ts)}，" +
+                            $"约 {(ts - now) / 60f:F1} 分钟后），等它接近再按 Fire");
+            return;
+        }
         var rushed = false;
         if (ts > tEnd) {
             ts = tEnd;
