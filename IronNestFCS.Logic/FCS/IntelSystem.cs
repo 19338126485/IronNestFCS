@@ -425,14 +425,26 @@ public class IntelSystem {
         }
 
         // 阶段 2：主题（有序，链式锚点，多解分支传播）。
-        // 纸带倒序（新在上）：同名主题周期性重报时，先出现的是最新批次，旧的跳过
-        // （活动报告类任务每个目标定期重报一批测量，实测确认）
-        var seenSubjectNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var subject in doc.Subjects) {
-            if (!seenSubjectNames.Add(subject.Name)) {
-                if (verbose) MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 跳过旧批次（已有更新的一批）");
+        // 同名主题去重：取【约束最多】的一份（实测：Primary 任务简报里的 '敌方集结区：'
+        // 空壳标题与 Secondary 活动报告撞名，先出现的空壳会把真测量批次顶掉）；
+        // 约束数并列时取先出现的（同一纸带内倒序 = 最新批次）。
+        var bestSubjectByName = new Dictionary<string, IntelSubject>(StringComparer.OrdinalIgnoreCase);
+        var orderedSubjects = new List<IntelSubject>();
+        foreach (var s in doc.Subjects) {
+            if (bestSubjectByName.TryGetValue(s.Name, out var cur)) {
+                if (s.Constraints.Count > cur.Constraints.Count) {
+                    orderedSubjects[orderedSubjects.IndexOf(cur)] = s;
+                    bestSubjectByName[s.Name] = s;
+                }
+                else if (verbose) {
+                    MelonLogger.Msg($"[Intel] 主题 '{s.Name}': 跳过重复批次（{s.Constraints.Count} 条约束 <= 已选 {cur.Constraints.Count} 条）");
+                }
                 continue;
             }
+            bestSubjectByName[s.Name] = s;
+            orderedSubjects.Add(s);
+        }
+        foreach (var subject in orderedSubjects) {
             // 同名敌军的 FO 距离圆并入本主题一起解
             var foExtra = foGroups.Remove(subject.Name, out var fel) ? fel : null;
 
