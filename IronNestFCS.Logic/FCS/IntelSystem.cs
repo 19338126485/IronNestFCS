@@ -424,8 +424,15 @@ public class IntelSystem {
             foList.Add(c);
         }
 
-        // 阶段 2：主题（有序，链式锚点，多解分支传播）
+        // 阶段 2：主题（有序，链式锚点，多解分支传播）。
+        // 纸带倒序（新在上）：同名主题周期性重报时，先出现的是最新批次，旧的跳过
+        // （活动报告类任务每个目标定期重报一批测量，实测确认）
+        var seenSubjectNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var subject in doc.Subjects) {
+            if (!seenSubjectNames.Add(subject.Name)) {
+                if (verbose) MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 跳过旧批次（已有更新的一批）");
+                continue;
+            }
             // 同名敌军的 FO 距离圆并入本主题一起解
             var foExtra = foGroups.Remove(subject.Name, out var fel) ? fel : null;
 
@@ -531,23 +538,7 @@ public class IntelSystem {
             }
 
             var best = merged[0];
-            // 活动报告没有名字：优先用落点附近【已揭示】敌方实体的真名（航拍点亮过的，
-            // 玩家本来就能看见，不算作弊）；否则按落点大格命名（汇总行会错配，不可信）。
-            string subjectName;
-            if (subject.Name == "活动报告") {
-                var revealedName = FindRevealedEnemyName(best.Point, 0.3f);
-                if (revealedName != null) {
-                    subjectName = revealedName;
-                    if (verbose) MelonLogger.Msg($"[Intel] 活动报告经已揭示实体识别为: {revealedName}");
-                }
-                else {
-                    subjectName = $"活动@{ZoneName(best.Point)}";
-                }
-            }
-            else {
-                subjectName = subject.Name;
-            }
-            best.Name = subjectName;
+            best.Name = subject.Name;
             best.TokenName ??= subject.TokenName;
             results.Add(best);
             var emitted = new List<Vector2> { best.Point };
@@ -562,7 +553,7 @@ public class IntelSystem {
                     break;
                 }
                 var alt = merged[i];
-                alt.Name = subjectName + (altCount == 0 ? "(alt)" : $"(alt{altCount + 1})");
+                alt.Name = subject.Name + (altCount == 0 ? "(alt)" : $"(alt{altCount + 1})");
                 alt.TokenName ??= subject.TokenName;
                 results.Add(alt);
                 emitted.Add(alt.Point);
@@ -572,7 +563,7 @@ public class IntelSystem {
                                     $"备选 ({alt.Point.x:F2},{alt.Point.y:F2}) score={alt.Score:F3}");
                 }
             }
-            RegisterAnchorOptions(subjectName, emitted);
+            RegisterAnchorOptions(subject.Name, emitted);
         }
 
         // 阶段 2.6：前线观测员（Spotter 卡）报告独立解算——没有同名主题可并入的敌军组。
@@ -737,13 +728,6 @@ public class IntelSystem {
     // 地图边界（km）：全任务地图 20×10（列 A–T、行 1–10），留 0.5km 边距。
     private static bool IsOnMap(Vector2 p) =>
         p.x is >= -0.5f and <= 20.5f && p.y is >= -0.5f and <= 10.5f;
-
-    /// <summary>网格坐标 → 大格名（如 (6.6,4.85) → G5），活动报告命名用。</summary>
-    private static string ZoneName(Vector2 p) {
-        var col = Mathf.Clamp(Mathf.FloorToInt(p.x), 0, 25);
-        var row = Mathf.Max(1, Mathf.FloorToInt(p.y) + 1);
-        return $"{(char)('A' + col)}{row}";
-    }
 
     /// <summary>
     /// 把本次解算结果同步进登记簿：同名条目原地更新（保留 已落子/已忽略 状态），
@@ -1413,32 +1397,6 @@ public class IntelSystem {
             }
         }
         return false;
-    }
-
-    /// <summary>
-    /// 找落点附近【已揭示】的敌方实体（航拍照片点亮过的目标，玩家本来就能在地图上看到，
-    /// 用它命名不算作弊）。仅当恰好一个已揭示敌方实体在半径内时返回其本地化名字。
-    /// </summary>
-    private static string? FindRevealedEnemyName(Vector2 gridPos, float radiusKm) {
-        const EntityRoles enemyBits = EntityRoles.Enemy | EntityRoles.Target | EntityRoles.OptionalTarget;
-        var fm = FireMission.Instance;
-        if (fm == null || fm.Entities == null) return null;
-        MapEntity? found = null;
-        foreach (var kv in fm.Entities) {
-            var e = kv.Value;
-            if (e == null || (e.Role & enemyBits) == 0) continue;
-            var loc = e.Location;
-            if (loc == null || loc.VisualRoot == null || !loc.VisualRoot.activeSelf) continue; // 未揭示不算
-            if (Vector2.Distance(WorldToGrid(e.Position), gridPos) > radiusKm) continue;
-            if (found != null) return null; // 多个已揭示实体挤在一起，不敢乱命名
-            found = e;
-        }
-        if (found == null) return null;
-        try {
-            if (found.Name != null && found.Name.TryGet(out var s) && !string.IsNullOrEmpty(s)) return s;
-        }
-        catch { /* 本地化查找失败则放弃命名 */ }
-        return null;
     }
 
     /// <summary>

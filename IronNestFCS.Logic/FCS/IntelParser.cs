@@ -106,11 +106,11 @@ public static class IntelParser {
     private static readonly Regex ActivityHeader =
         new(@"报告活动于坐标\s*(?<cell>[A-Z]\d{1,2})", RegexOptions.Compiled);
     private static readonly Regex ActivityDist =
-        new(@"^(?<anchor>[^\s：:]+)：\s*(?<dist>[\d.]+)\s*(?<unit>km|公里|千米)\s*$", RegexOptions.Compiled);
+        new(@"^(?<anchor>[^\s：:]+)[:：]\s*(?<dist>[\d.]+)\s*(?<unit>km|公里|千米)\s*$", RegexOptions.Compiled);
     private static readonly Regex ActivityBearing =
-        new(@"^(?<anchor>[^\s：:]+)：\s*(?<deg>\d{1,3})\s*°\s*$", RegexOptions.Compiled);
+        new(@"^(?<anchor>[^\s：:]+)[:：]\s*(?<deg>\d{1,3})\s*°\s*$", RegexOptions.Compiled);
     private static readonly Regex ActivityCompass =
-        new(@"^(?<anchor>[^\s：:]+)：\s*(?<dir>[北东南西偏]+)\s*$", RegexOptions.Compiled);
+        new(@"^(?<anchor>[^\s：:]+)[:：]\s*(?<dir>[北东南西偏]+)\s*$", RegexOptions.Compiled);
 
     /// <summary>中文十六向罗盘词 → 方位角（罗盘约定：0=北，顺时针）。两种偏词写法全收（西偏北/西北偏西、西南偏西等）。</summary>
     private static readonly (string word, float deg)[] CompassWords = {
@@ -159,46 +159,22 @@ public static class IntelParser {
         if (string.IsNullOrWhiteSpace(text)) return doc;
 
         IntelSubject? current = null;
-        List<ParsedItem>? activityBlock = null;  // 活动报告的连续测量行
-
-        // 测量块收尾：汇成一个匿名主题（命名在解算后按落点大格生成，见 IntelSystem；
-        // 汇总行只做块分隔——实测它与测量块的对应关系会错配，不可信）。
-        void FlushActivity() {
-            if (activityBlock == null) return;
-            var subject = new IntelSubject {
-                Name = "活动报告",
-                TokenName = "MapToken_Artillery",
-            };
-            subject.Constraints.AddRange(activityBlock);
-            doc.Subjects.Add(subject);
-            activityBlock = null;
-        }
-
-        // 加入一行测量。同一锚点在块内重复 = 新一轮测量（每批每个观测员恰好一行），先收尾再开新块。
-        void AddActivity(ParsedItem item) {
-            if (activityBlock != null) {
-                foreach (var it in activityBlock) {
-                    if (it.AnchorText == item.AnchorText) { FlushActivity(); break; }
-                }
-            }
-            (activityBlock ??= new List<ParsedItem>()).Add(item);
-        }
-
         foreach (var rawLine in text.Split('\n')) {
             var line = RichTag.Replace(rawLine, "").Trim();
             if (line.Length == 0 || line == "." || line == "- - -") continue;
 
             // ===== 活动报告（观测员三角测量） =====
-            // 汇总行："报告活动于坐标 B10"（只做测量块的分隔符，不参与命名）
+            // 实测结构（截图确认）：与其他报文同一"主题+约束"格式——
+            //   "敌方集结区："（标准主题行，SubjectHeader 解析）+ 每个观测员一行测量。
+            // 测量行只需翻译成约束挂到当前主题名下，不需要任何特殊分组。
+            // 汇总行"报告活动于坐标 M3"只是 1km 精度的大格提示，无几何价值，静默消费。
             var mAct = ActivityHeader.Match(line);
-            if (mAct.Success) {
-                FlushActivity();
-                continue;
-            }
-            // 测量行：距离 / 方位角 / 罗盘方位词（模糊）
+            if (mAct.Success) continue;
+
+            // 测量行：距离 / 方位角 / 罗盘方位词（模糊）。有主题归主题，无主题进散条目池。
             var ma = ActivityDist.Match(line);
             if (ma.Success) {
-                AddActivity(new ParsedItem {
+                (current != null ? current.Constraints : doc.Items).Add(new ParsedItem {
                     RawLine = line, Kind = "distance", AnchorText = ma.Groups["anchor"].Value.Trim(),
                     Value1 = ToKm(ma),
                 });
@@ -206,7 +182,7 @@ public static class IntelParser {
             }
             ma = ActivityBearing.Match(line);
             if (ma.Success) {
-                AddActivity(new ParsedItem {
+                (current != null ? current.Constraints : doc.Items).Add(new ParsedItem {
                     RawLine = line, Kind = "bearing", AnchorText = ma.Groups["anchor"].Value.Trim(),
                     Value1 = ParseFloat(ma.Groups["deg"].Value),
                 });
@@ -219,7 +195,7 @@ public static class IntelParser {
                     if (ma.Groups["dir"].Value == word) { deg = d; break; }
                 }
                 if (deg >= 0f) {
-                    AddActivity(new ParsedItem {
+                    (current != null ? current.Constraints : doc.Items).Add(new ParsedItem {
                         RawLine = line, Kind = "bearing", AnchorText = ma.Groups["anchor"].Value.Trim(),
                         Value1 = deg, Fuzzy = true,
                     });
@@ -227,7 +203,6 @@ public static class IntelParser {
                 }
                 // 未收录的罗盘词：落入未解析日志取样
             }
-            else FlushActivity(); // 非测量行：测量块结束
 
             // 网格坐标行（锚点/直接定位）
             var m = GridRef.Match(line);
@@ -353,7 +328,6 @@ public static class IntelParser {
                 MelonLogger.Msg($"[Intel] 未能解析的行({sourceTag}): {line}");
             }
         }
-        FlushActivity(); // 文本末尾可能还挂着一组测量行
         return doc;
     }
 
