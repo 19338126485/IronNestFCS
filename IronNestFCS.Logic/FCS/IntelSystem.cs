@@ -152,6 +152,14 @@ public class IntelSystem {
         if (fm == null) return;
         DetectManualPlacements();
 
+        // 自动车队触发不能依赖情报文本刷新：滑动停稳后可能再无新报文，
+        // 触发评估会因此饿死（2026-08-13 实测：停稳 28 秒无任何文本，车队从未触发）。
+        // 故在轮询里独立评估（RequestConvoyIntel 自身幂等：已在跑/已失败不再重复）。
+        if (turretRelocationPending && fcs.Convoy.AutoConvoy && !fcs.Convoy.NestGps &&
+            !fcs.Convoy.TurretInTransit && TryGetCurrentTurretZone(out var zone)) {
+            fcs.Convoy.RequestConvoyIntel(zone, RelocEpoch);
+        }
+
         if (!AutoRefresh) return;
         var hash = ComputeIntelHash();
         if (hash.Length == 0 || hash == lastIntelHash) return;
