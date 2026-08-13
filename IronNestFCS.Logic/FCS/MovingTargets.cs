@@ -95,6 +95,8 @@ public class MovingTargetSystem {
     private float clockOffset = 36000f;
     private bool clockOffsetLearned;
     private bool timerDumped;
+    /// <summary>已处理过的击毁通报名（纸带会重印旧通报，不除重会把"登陆艇"的重印误杀"登陆艇#2"）。</summary>
+    private readonly HashSet<string> consumedDestroyed = new(StringComparer.OrdinalIgnoreCase);
 
     public void Bind(FSC fcs, IntelSystem intel) {
         this.fcs = fcs;
@@ -104,6 +106,7 @@ public class MovingTargetSystem {
     public void ShutDown() {
         tracks.Clear();
         clockChecked.Clear();
+        consumedDestroyed.Clear();
         fcs = null;
         intel = null;
     }
@@ -112,6 +115,7 @@ public class MovingTargetSystem {
     public void ResetMission() {
         tracks.Clear();
         clockChecked.Clear();
+        consumedDestroyed.Clear();
         clockOffset = 36000f;
         clockOffsetLearned = false;
         timerDumped = false;
@@ -174,14 +178,26 @@ public class MovingTargetSystem {
         DumpTimersOnce();
         var now = ScenarioNow();
 
-        // 损毁除名（"已确认摧毁 <名称>"）
+        // 损毁除名（"已确认摧毁 <名称>" / "高优先级目标<名称>已摧毁"）。
+        // 先精确匹配（"登陆艇"与"登陆艇#2"是不同目标），再退化包含匹配。
         foreach (var name in doc.DestroyedNames) {
+            if (!consumedDestroyed.Add(name)) continue; // 纸带重印的旧通报
             string? hit = null;
             foreach (var kv in tracks) {
-                if (kv.Key.Contains(name, StringComparison.OrdinalIgnoreCase) ||
-                    name.Contains(kv.Value.DisplayName, StringComparison.OrdinalIgnoreCase)) {
+                if (string.Equals(kv.Key, name, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(kv.Value.DisplayName, name, StringComparison.OrdinalIgnoreCase)) {
                     hit = kv.Key;
                     break;
+                }
+            }
+            if (hit == null) {
+                foreach (var kv in tracks) {
+                    if (kv.Key.Contains(name, StringComparison.OrdinalIgnoreCase) ||
+                        (kv.Value.DisplayName.Length > 0 &&
+                         name.Contains(kv.Value.DisplayName, StringComparison.OrdinalIgnoreCase))) {
+                        hit = kv.Key;
+                        break;
+                    }
                 }
             }
             if (hit != null) {

@@ -223,9 +223,11 @@ public static class IntelParser {
         new(@"以\s*(?<kn>[\d.]+)\s*节之航速沿\s*(?<deg>\d{1,3})\s*°\s*航向", RegexOptions.Compiled);
     private static readonly Regex ShipCourse3 =
         new(@"正以\s*(?<deg>\d{1,3})\s*°\s*航向[、,，]\s*航速\s*(?<kn>[\d.]+)\s*节", RegexOptions.Compiled);
-    // "已确认摧毁 皇家海军罗金厄姆号。"（移动目标损毁除名）
+    // 击毁通报（移动目标除名）："已确认摧毁 罗金厄姆号。" / "高优先级目标登陆艇#2已摧毁，+75个征用点。"
     private static readonly Regex DestroyedReport =
         new(@"已确认摧毁\s*(?<name>[^。.\n]+)", RegexOptions.Compiled);
+    private static readonly Regex HighPrioDestroyed =
+        new(@"高优先级目标\s*(?<name>.+?)\s*已摧毁", RegexOptions.Compiled);
 
     /// <summary>"HH:MM:SS" → 秒（报文 T= 时刻即 MissionStatsTracker.missionTime 的格式化）。</summary>
     private static float Hms(Match m) =>
@@ -342,6 +344,7 @@ public static class IntelParser {
             // "9.7节 = 20秒行驶0.10千米。"等换算说明行：无独立信息，静默消费（否则进未解析日志刷屏）
             if (line.Contains("节 =") || line.Contains("节=")) continue;
             var mDestroyed = DestroyedReport.Match(line);
+            if (!mDestroyed.Success) mDestroyed = HighPrioDestroyed.Match(line);
             if (mDestroyed.Success) {
                 doc.DestroyedNames.Add(mDestroyed.Groups["name"].Value.Trim());
                 continue;
