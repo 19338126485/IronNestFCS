@@ -82,7 +82,8 @@ public static class GeoSolver {
     /// <summary>候选点去重半径（km）：不同约束对产生的相同交点只保留一个。</summary>
     private const float DedupeKm = 0.05f;
 
-    /// <summary>方位线 ∩ 距离圆：0~2 个交点，只保留落在射线前半部分（t ≥ 0）的。</summary>
+    /// <summary>方位线 ∩ 距离圆：0~2 个交点，只保留落在射线前半部分（t ≥ 0）的。
+    /// 擦边未交（报文舍入所致，实测曾差 2m 而丢目标）时用最接近点近似，标低置信度。</summary>
     public static List<Vector2> Intersect(BearingLine l, DistanceCircle c) {
         var res = new List<Vector2>();
         var d = l.Dir;
@@ -91,7 +92,16 @@ public static class GeoSolver {
         var b = f.x * d.x + f.y * d.y;
         var cc = f.x * f.x + f.y * f.y - c.RadiusKm * c.RadiusKm;
         var disc = b * b - cc;
-        if (disc < 0f) return res;
+        if (disc < 0f) {
+            // 相离：圆心到射线的垂直距离超出半径一点点 → 用最接近点（圆心在射线上的垂足）近似
+            var rel = c.Center - l.Origin;
+            var perp = Mathf.Abs(rel.x * d.y - rel.y * d.x);
+            var tClosest = rel.x * d.x + rel.y * d.y;
+            if (perp - c.RadiusKm <= NearMissToleranceKm && tClosest >= 0f) {
+                res.Add(l.Origin + d * tClosest);
+            }
+            return res;
+        }
         var sq = Mathf.Sqrt(disc);
         foreach (var t in new[] { -b + sq, -b - sq }) {
             if (t >= 0f) res.Add(l.Origin + d * t);
@@ -99,14 +109,31 @@ public static class GeoSolver {
         return res;
     }
 
-    /// <summary>距离圆 ∩ 距离圆：0~2 个交点。</summary>
+    /// <summary>擦边未交容差（km）：输入舍入的误差预算（锚点 0.05×2 + 整数度 ~0.03@4km + 距离 0.005）。</summary>
+    public const float NearMissToleranceKm = 0.2f;
+
+    /// <summary>距离圆 ∩ 距离圆：0~2 个交点。擦边相离/内含时取间隙中点近似（标低置信度）。</summary>
     public static List<Vector2> Intersect(DistanceCircle a, DistanceCircle b) {
         var res = new List<Vector2>();
         var delta = b.Center - a.Center;
         var d = delta.magnitude;
         if (d < 1e-6f) return res;                          // 同心圆：无解或无数解，都不可用
-        if (d > a.RadiusKm + b.RadiusKm) return res;        // 相离
-        if (d < Mathf.Abs(a.RadiusKm - b.RadiusKm)) return res; // 内含
+        if (d > a.RadiusKm + b.RadiusKm) {
+            // 相离一点点：取两圆间间隙的中点
+            var gap = d - a.RadiusKm - b.RadiusKm;
+            if (gap <= NearMissToleranceKm) res.Add(a.Center + delta / d * (a.RadiusKm + gap * 0.5f));
+            return res;
+        }
+        if (d < Mathf.Abs(a.RadiusKm - b.RadiusKm)) {
+            // 内含差一点点：取两圆最近边缘间的中点
+            var gap = Mathf.Abs(a.RadiusKm - b.RadiusKm) - d;
+            if (gap > NearMissToleranceKm) return res;
+            var p = a.RadiusKm >= b.RadiusKm
+                ? a.Center + delta / d * (a.RadiusKm - gap * 0.5f)
+                : b.Center - delta / d * (b.RadiusKm - gap * 0.5f);
+            res.Add(p);
+            return res;
+        }
         var t = (a.RadiusKm * a.RadiusKm - b.RadiusKm * b.RadiusKm + d * d) / (2f * d);
         var h2 = a.RadiusKm * a.RadiusKm - t * t;
         if (h2 < 0f) h2 = 0f; // 相切

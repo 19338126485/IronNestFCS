@@ -522,7 +522,11 @@ public class IntelSystem {
                 MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 剪除 {beforePrune - merged.Count} 个图外假解");
             }
             if (merged.Count == 0) {
-                if (verbose) MelonLogger.Msg($"[Intel] 主题 '{subject.Name}': 所有交点均在图外，无法定位");
+                if (verbose) {
+                    MelonLogger.Msg(beforePrune == 0
+                        ? $"[Intel] 主题 '{subject.Name}': 约束两两无交点（舍入擦边超容差或报文矛盾），无法定位"
+                        : $"[Intel] 主题 '{subject.Name}': 所有交点均在图外，无法定位");
+                }
                 continue;
             }
             merged.Sort((x, y) => x.Score.CompareTo(y.Score));
