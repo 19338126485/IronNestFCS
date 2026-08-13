@@ -531,11 +531,22 @@ public class IntelSystem {
             }
 
             var best = merged[0];
-            // 活动报告没有名字：按落点所在大格命名（实测汇总行会错配，落点大格才是可靠标签，
-            // 与游戏自己的"报告活动于坐标 X"叫法自然吻合）
-            var subjectName = subject.Name == "活动报告"
-                ? $"活动@{ZoneName(best.Point)}"
-                : subject.Name;
+            // 活动报告没有名字：优先用落点附近【已揭示】敌方实体的真名（航拍点亮过的，
+            // 玩家本来就能看见，不算作弊）；否则按落点大格命名（汇总行会错配，不可信）。
+            string subjectName;
+            if (subject.Name == "活动报告") {
+                var revealedName = FindRevealedEnemyName(best.Point, 0.3f);
+                if (revealedName != null) {
+                    subjectName = revealedName;
+                    if (verbose) MelonLogger.Msg($"[Intel] 活动报告经已揭示实体识别为: {revealedName}");
+                }
+                else {
+                    subjectName = $"活动@{ZoneName(best.Point)}";
+                }
+            }
+            else {
+                subjectName = subject.Name;
+            }
             best.Name = subjectName;
             best.TokenName ??= subject.TokenName;
             results.Add(best);
@@ -1402,6 +1413,32 @@ public class IntelSystem {
             }
         }
         return false;
+    }
+
+    /// <summary>
+    /// 找落点附近【已揭示】的敌方实体（航拍照片点亮过的目标，玩家本来就能在地图上看到，
+    /// 用它命名不算作弊）。仅当恰好一个已揭示敌方实体在半径内时返回其本地化名字。
+    /// </summary>
+    private static string? FindRevealedEnemyName(Vector2 gridPos, float radiusKm) {
+        const EntityRoles enemyBits = EntityRoles.Enemy | EntityRoles.Target | EntityRoles.OptionalTarget;
+        var fm = FireMission.Instance;
+        if (fm == null || fm.Entities == null) return null;
+        MapEntity? found = null;
+        foreach (var kv in fm.Entities) {
+            var e = kv.Value;
+            if (e == null || (e.Role & enemyBits) == 0) continue;
+            var loc = e.Location;
+            if (loc == null || loc.VisualRoot == null || !loc.VisualRoot.activeSelf) continue; // 未揭示不算
+            if (Vector2.Distance(WorldToGrid(e.Position), gridPos) > radiusKm) continue;
+            if (found != null) return null; // 多个已揭示实体挤在一起，不敢乱命名
+            found = e;
+        }
+        if (found == null) return null;
+        try {
+            if (found.Name != null && found.Name.TryGet(out var s) && !string.IsNullOrEmpty(s)) return s;
+        }
+        catch { /* 本地化查找失败则放弃命名 */ }
+        return null;
     }
 
     /// <summary>
