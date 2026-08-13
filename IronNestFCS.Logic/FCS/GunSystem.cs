@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using Il2Cpp;
 using Il2CppTMPro;
 using MelonLoader;
@@ -232,6 +232,17 @@ public class GunSystem {
         }
     }
     
+    /// <summary>
+    /// 当前装填/仰角下的预测飞行时间（秒，含击发延迟 fireDelay）。
+    /// PredictedImpactTime 由 GunController 在仰角/弹种就绪后持续更新（手表倒计时同源），
+    /// 官方注释明确其为"travel only"，故补上 fireDelay。0 = 无有效预测。
+    /// </summary>
+    public float PredictedFlightSeconds() {
+        if (gunController == null) return 0f;
+        var t = gunController.PredictedImpactTime;
+        return t > 0f ? t + gunController.fireDelay : 0f;
+    }
+
     public int RemainingCharges() {
         return (int)remainingCharges.CurrentNumber;
     }

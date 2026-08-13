@@ -48,6 +48,8 @@ public class FSC
     public readonly IntelSystem Intel = new();
     /// <summary>紧急转移/后勤车队辅助（转移检测、NestGps 作弊直读、卡牌侦察）。</summary>
     public readonly ConvoyAssist Convoy = new();
+    /// <summary>移动目标（列车/舰船）：行进路线推算与定时开火。</summary>
+    public readonly MovingTargetSystem Moving = new();
     
     // ===== 任务调度 =====
     // 用户不再指定炮管：任务入队后由调度器派给空闲炮管，炮管打完一发自动拉下一个。
@@ -98,6 +100,7 @@ public class FSC
         // 情报系统不依赖场景控件绑定：即使炮塔/控制台没绑上，Survey 的侦察 dump 仍然有用。
         Intel.Bind(this);
         Convoy.Bind(this, Intel);
+        Moving.Bind(this, Intel);
         IsBound = MapTable.TryBind()
                   && BallisticCalculator.TryBind()
                   && LeftGun.TryBind("Left")
@@ -142,6 +145,7 @@ public class FSC
         _sceneInteractor.ShutDown();
         Intel.ShutDown();
         Convoy.ShutDown();
+        Moving.ShutDown();
         try { _harmony?.UnpatchSelf(); }
         catch (Exception ex) { MelonLogger.Error($"[FCS] UnpatchSelf failed: {ex}"); }
         _harmony = null;
@@ -338,7 +342,14 @@ public class FSC
             yield return TriggerConsole.ConfirmElevation();
             yield return TriggerConsole.ReadyToFire();
             yield return TriggerConsole.Arm(leftRight);
-            if (_sceneInteractor.AutoFire) {
+            if (task.timed) {
+                // 定时开火（移动目标）：待机到 命中时刻 − 飞行时间 再击发，与 AutoFire 开关无关
+                task.progress = Progress.AwaitingStrikeTime;
+                yield return WaitForStrikeMoment(gunSys, task);
+                TriggerConsole.Fire();
+                MelonLogger.Msg($"[FCS] 定时击发: {task.strikeLabel}");
+            }
+            else if (_sceneInteractor.AutoFire) {
                 TriggerConsole.Fire();
             }
             yield return gunSys.WaitFire();
@@ -385,6 +396,40 @@ public class FSC
         // 转向期间主流程可能已放弃（如解算失败）——此时主流程不会再击发，由这里归还。
         if (res.Canceled) {
             ReleaseTurretOnce(res);
+        }
+    }
+
+    /// <summary>
+    /// 定时开火的待机循环：持续读 战场时钟 与 预测飞行时间（含 fireDelay），
+    /// 到 命中时刻 − 飞行时间 返回（调用方立即击发）。轮询间隔随剩余时间减半逼近，
+    /// 末段精度 ~0.05s。飞行时间读数无效（0）时退化为按预定时刻直接击发并告警。
+    /// </summary>
+    private IEnumerator WaitForStrikeMoment(GunSystem gunSys, ArtilleryTask task) {
+        var logged = false;
+        var zeroFlightWarned = false;
+        while (true) {
+            var now = Moving.ScenarioNow();
+            if (now < 0f) {
+                MelonLogger.Error("[FCS] 定时开火：任务时钟丢失，立即击发");
+                yield break;
+            }
+            var flight = gunSys.PredictedFlightSeconds();
+            var remain = task.strikeTime - now;
+            if (!logged) {
+                MelonLogger.Msg($"[FCS] 定时开火待机: {task.strikeLabel} 剩余 {remain:F1}s 飞行时间 {flight:F1}s");
+                logged = true;
+            }
+            if (flight > 0f) {
+                if (remain <= flight) yield break;
+            }
+            else {
+                if (!zeroFlightWarned) {
+                    MelonLogger.Warning("[FCS] 定时开火：飞行时间读数为 0（预测未就绪？），将按预定时刻直接击发");
+                    zeroFlightWarned = true;
+                }
+                if (remain <= 0.2f) yield break;
+            }
+            yield return new WaitForSeconds(Mathf.Clamp((remain - flight) * 0.5f, 0.05f, 1f));
         }
     }
 

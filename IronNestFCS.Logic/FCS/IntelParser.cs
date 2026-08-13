@@ -28,14 +28,74 @@ public sealed class IntelSubject {
     public readonly List<ParsedItem> Constraints = new();
 }
 
-/// <summary>一段情报文本的解析结果：散条目（gridref 等）+ 有序主题列表。</summary>
+/// <summary>
+/// 列车时刻表原始数据（移动目标，模板见 resources.assets 本地化串"列车时刻表"）：
+/// 到达站"穆拉谷地 总站：J6 0:4"、"估计到站时间：T=10:16:50"、
+/// "铁路线走向笔直。自总站的方位角 090°。"、"路径点-A - 距车站6.00km：T=10:06:50"。
+/// 运行事件："- 10:06:50 - 机车经过 路径点-A：P6 0:4。"、"列车停止中 - 10:06:51"+"距总站 6.00km。"。
+/// 报文里的 T= 时刻就是 [TIMER &lt;MissionTime&gt;] 打印的 MissionStatsTracker.missionTime（秒）。
+/// StopT 哨兵值：-1=未停止，-3="已出轨/已抵达"（停止时刻未知，取 ingest 时的当前时刻）。
+/// </summary>
+public sealed class TrainScheduleRaw {
+    public string StationName = "";
+    public float StationGx = float.NaN, StationGy = float.NaN;
+    public float BearingDeg = -1f;
+    public float ArrivalT = -1f;
+    public readonly List<(string name, float distKm, float t)> Waypoints = new();
+    public readonly List<(string name, float t, float gx, float gy)> Passages = new();
+    public float StopT = -1f;
+    public float StopDistKm = -1f;
+    public bool Destroyed;
+}
+
+/// <summary>
+/// 舰船目击报告（模板"舰船数据"）："<船名>已发现：" + "在 T:10:06:50 时经过 P6 0:4。"
+/// + "以9.7节速度航行12°航向。"。航速单位节（1节=1.852km/h，模板自证：9.7节=20秒0.10千米）。
+/// </summary>
+public sealed class ShipSighting {
+    public string Name = "";
+    public float T = -1f;
+    public float Gx, Gy;
+    public float HeadingDeg = -1f;
+    public float Knots = -1f;
+}
+
+/// <summary>一段情报文本的解析结果：散条目（gridref 等）+ 有序主题列表 + 移动目标数据。</summary>
 public sealed class IntelDocument {
     public readonly List<ParsedItem> Items = new();
     public readonly List<IntelSubject> Subjects = new();
+    public TrainScheduleRaw? Train;
+    public readonly List<ShipSighting> Ships = new();
+    /// <summary>报文里确认摧毁的移动目标名（"已确认摧毁 <名称>"）。</summary>
+    public readonly List<string> DestroyedNames = new();
 
     public void Merge(IntelDocument other) {
         Items.AddRange(other.Items);
         Subjects.AddRange(other.Subjects);
+        if (other.Train != null) {
+            Train ??= new TrainScheduleRaw();
+            var t = Train;
+            var o = other.Train;
+            if (t.StationName.Length == 0) {
+                t.StationName = o.StationName;
+                t.StationGx = o.StationGx;
+                t.StationGy = o.StationGy;
+            }
+            if (t.BearingDeg < 0f) t.BearingDeg = o.BearingDeg;
+            if (t.ArrivalT < 0f) t.ArrivalT = o.ArrivalT;
+            foreach (var w in o.Waypoints) {
+                if (!t.Waypoints.Exists(x => x.name == w.name && Math.Abs(x.t - w.t) < 0.5f)) t.Waypoints.Add(w);
+            }
+            foreach (var p in o.Passages) {
+                if (!t.Passages.Exists(x => x.name == p.name && Math.Abs(x.t - p.t) < 0.5f)) t.Passages.Add(p);
+            }
+            if (o.StopT == -3f) t.StopT = -3f;
+            else if (o.StopT > t.StopT) t.StopT = o.StopT;
+            if (o.StopDistKm >= 0f) t.StopDistKm = o.StopDistKm;
+            t.Destroyed |= o.Destroyed;
+        }
+        Ships.AddRange(other.Ships);
+        DestroyedNames.AddRange(other.DestroyedNames);
     }
 }
 
@@ -129,6 +189,48 @@ public static class IntelParser {
         new(@"(?<deg>\d{1,3})\s*自\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
             RegexOptions.Compiled);
 
+    // ===== 列车时刻表 / 舰船动态（移动目标，模板见 resources.assets，2026-08-13 实测） =====
+    // "铁路线走向笔直。自总站的方位角 090°。"（方位角锚点即总站，无需再解析锚点名）
+    private static readonly Regex TrainBearing =
+        new(@"铁路线走向笔直.*?自\s*(?<anchor>.+?)\s*的方位角\s*(?<deg>\d{1,3})", RegexOptions.Compiled);
+    // "路径点-A - 距车站6.00km：T=10:06:50"
+    private static readonly Regex TrainWaypoint =
+        new(@"^(?<name>\S+?)\s*[-–—]\s*距(?:离)?车站\s*(?<dist>[\d.]+)\s*(?:km|公里|千米)\s*[：:]\s*T=(?<h>\d{1,2}):(?<mi>\d{2}):(?<s>\d{2})",
+            RegexOptions.Compiled);
+    // "到达时间：T=10:33:30" / "估计到站时间：T=10:16:50"
+    private static readonly Regex TrainArrival =
+        new(@"(?:到达时间|估计到站时间|到站时间)\s*[：:]\s*T=(?<h>\d{1,2}):(?<mi>\d{2}):(?<s>\d{2})",
+            RegexOptions.Compiled);
+    // "- 10:06:50 - 机车经过 路径点-A：P6 0:4。"（实测位置+时刻，同时用于时钟校验）
+    private static readonly Regex TrainPassage =
+        new(@"^-\s*(?<h>\d{1,2}):(?<mi>\d{2}):(?<s>\d{2})\s*-\s*机车经过\s*(?<name>.+?)\s*[：:]\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
+            RegexOptions.Compiled);
+    // "列车停止中 - 10:06:51"
+    private static readonly Regex TrainStop =
+        new(@"列车停止中\s*-\s*(?<h>\d{1,2}):(?<mi>\d{2}):(?<s>\d{2})", RegexOptions.Compiled);
+    // "距总站 6.00km。"（停止时距总站的距离，与停止时刻配对）
+    private static readonly Regex TrainStopDist =
+        new(@"^距\s*总站\s*(?<dist>[\d.]+)\s*(?:km|公里|千米)", RegexOptions.Compiled);
+    // 舰船目击："<船名>已发现："（块头）+ "在 T:10:06:50 时经过 P6 0:4。" + "以9.7节速度航行12°航向。"
+    private static readonly Regex ShipHeader =
+        new(@"^(?<name>.+?)已发现\s*[：:]\s*$", RegexOptions.Compiled);
+    private static readonly Regex ShipPosTime =
+        new(@"在\s*T\s*[:：=]\s*(?<h>\d{1,2}):(?<mi>\d{2}):(?<s>\d{2})\s*时经[过過]\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
+            RegexOptions.Compiled);
+    private static readonly Regex ShipCourse1 =
+        new(@"以\s*(?<kn>[\d.]+)\s*节速度航行\s*(?<deg>\d{1,3})\s*°?\s*航向", RegexOptions.Compiled);
+    private static readonly Regex ShipCourse2 =
+        new(@"以\s*(?<kn>[\d.]+)\s*节之航速沿\s*(?<deg>\d{1,3})\s*°\s*航向", RegexOptions.Compiled);
+    private static readonly Regex ShipCourse3 =
+        new(@"正以\s*(?<deg>\d{1,3})\s*°\s*航向[、,，]\s*航速\s*(?<kn>[\d.]+)\s*节", RegexOptions.Compiled);
+    // "已确认摧毁 皇家海军罗金厄姆号。"（移动目标损毁除名）
+    private static readonly Regex DestroyedReport =
+        new(@"已确认摧毁\s*(?<name>[^。.\n]+)", RegexOptions.Compiled);
+
+    /// <summary>"HH:MM:SS" → 秒（报文 T= 时刻即 MissionStatsTracker.missionTime 的格式化）。</summary>
+    private static float Hms(Match m) =>
+        ParseFloat(m.Groups["h"].Value) * 3600f + ParseFloat(m.Groups["mi"].Value) * 60f + ParseFloat(m.Groups["s"].Value);
+
     /// <summary>裸网格坐标（无名称前缀，如 "H4 2:7"）→ 网格公里坐标（子格中心），与 GridRef 行同一换算。</summary>
     private static (float gx, float gy) ParseBareGrid(Match m, string p) => (
         char.ToUpperInvariant(m.Groups[p + "col"].Value[0]) - 'A' + ParseFloat(m.Groups[p + "sx"].Value) / 10f + SubGridCenter,
@@ -159,9 +261,91 @@ public static class IntelParser {
         if (string.IsNullOrWhiteSpace(text)) return doc;
 
         IntelSubject? current = null;
+        ShipSighting? pendingShip = null; // "已发现："块头开启，随后两行填时刻/经过点与航向/航速
         foreach (var rawLine in text.Split('\n')) {
             var line = RichTag.Replace(rawLine, "").Trim();
             if (line.Length == 0 || line == "." || line == "- - -") continue;
+
+            // ===== 移动目标：列车时刻表 / 舰船目击（必须先于主题行、T= 跳过等通用逻辑） =====
+            if (line.Contains("轨道走向") || line.Contains("进入段") || line.Contains("列车时刻表")) continue;
+            var mTrain = TrainBearing.Match(line);
+            if (mTrain.Success) {
+                EnsureTrain(doc).BearingDeg = ParseFloat(mTrain.Groups["deg"].Value);
+                continue;
+            }
+            mTrain = TrainWaypoint.Match(line);
+            if (mTrain.Success) {
+                EnsureTrain(doc).Waypoints.Add((mTrain.Groups["name"].Value.Trim(),
+                    ParseFloat(mTrain.Groups["dist"].Value), Hms(mTrain)));
+                continue;
+            }
+            mTrain = TrainArrival.Match(line);
+            if (mTrain.Success) {
+                EnsureTrain(doc).ArrivalT = Hms(mTrain);
+                continue;
+            }
+            mTrain = TrainPassage.Match(line);
+            if (mTrain.Success) {
+                var (pgx, pgy) = ParseBareGrid(mTrain, "");
+                EnsureTrain(doc).Passages.Add((mTrain.Groups["name"].Value.Trim(), Hms(mTrain), pgx, pgy));
+                continue;
+            }
+            mTrain = TrainStop.Match(line);
+            if (mTrain.Success) {
+                var tr = EnsureTrain(doc);
+                var t = Hms(mTrain);
+                if (t > tr.StopT) tr.StopT = t; // 取最新停止时刻
+                continue;
+            }
+            mTrain = TrainStopDist.Match(line);
+            if (mTrain.Success) {
+                EnsureTrain(doc).StopDistKm = ParseFloat(mTrain.Groups["dist"].Value);
+                continue;
+            }
+            if (line.Contains("列车已出轨")) { EnsureTrain(doc).StopT = -3f; continue; }
+            if (line.Contains("列车已抵达") || line.Contains("列车已到达")) {
+                var tr = EnsureTrain(doc);
+                tr.StopT = -3f;      // 到站=停在总站（时刻未给出时取 ingest 当前时刻）
+                tr.StopDistKm = 0f;
+                continue;
+            }
+            if (line.Contains("列车被完全摧毁") || line.Contains("增援列车已摧毁")) {
+                EnsureTrain(doc).Destroyed = true;
+                continue;
+            }
+            var mShip = ShipHeader.Match(line);
+            if (mShip.Success) {
+                pendingShip = new ShipSighting { Name = mShip.Groups["name"].Value.Trim() };
+                doc.Ships.Add(pendingShip);
+                continue;
+            }
+            mShip = ShipPosTime.Match(line);
+            if (mShip.Success) {
+                if (pendingShip != null) {
+                    var (sgx, sgy) = ParseBareGrid(mShip, "");
+                    pendingShip.T = Hms(mShip);
+                    pendingShip.Gx = sgx;
+                    pendingShip.Gy = sgy;
+                }
+                continue;
+            }
+            mShip = ShipCourse1.Match(line);
+            if (!mShip.Success) mShip = ShipCourse2.Match(line);
+            if (!mShip.Success) mShip = ShipCourse3.Match(line);
+            if (mShip.Success) {
+                if (pendingShip != null) {
+                    pendingShip.Knots = ParseFloat(mShip.Groups["kn"].Value);
+                    pendingShip.HeadingDeg = ParseFloat(mShip.Groups["deg"].Value);
+                }
+                continue;
+            }
+            // "9.7节 = 20秒行驶0.10千米。"等换算说明行：无独立信息，静默消费（否则进未解析日志刷屏）
+            if (line.Contains("节 =") || line.Contains("节=")) continue;
+            var mDestroyed = DestroyedReport.Match(line);
+            if (mDestroyed.Success) {
+                doc.DestroyedNames.Add(mDestroyed.Groups["name"].Value.Trim());
+                continue;
+            }
 
             // ===== 活动报告（观测员三角测量） =====
             // 实测结构（截图确认）：与其他报文同一"主题+约束"格式——
@@ -208,10 +392,19 @@ public static class IntelParser {
             var m = GridRef.Match(line);
             if (m.Success) {
                 var col = char.ToUpperInvariant(m.Groups["col"].Value[0]) - 'A';
+                var gx = col + ParseFloat(m.Groups["sx"].Value) / 10f + SubGridCenter;
+                var gy = ParseFloat(m.Groups["row"].Value) - 1f + ParseFloat(m.Groups["sy"].Value) / 10f + SubGridCenter;
+                var refName = m.Groups["name"].Value.Trim();
+                // "穆拉谷地 总站：J6 0:4"：列车时刻表的到达站，同时是移动目标解算的车站锚点
+                if (refName.EndsWith("总站")) {
+                    var tr = EnsureTrain(doc);
+                    tr.StationName = refName;
+                    tr.StationGx = gx;
+                    tr.StationGy = gy;
+                }
                 doc.Items.Add(new ParsedItem {
-                    RawLine = line, Kind = "gridref", AnchorText = m.Groups["name"].Value.Trim(),
-                    Value1 = col + ParseFloat(m.Groups["sx"].Value) / 10f + SubGridCenter,
-                    Value2 = ParseFloat(m.Groups["row"].Value) - 1f + ParseFloat(m.Groups["sy"].Value) / 10f + SubGridCenter,
+                    RawLine = line, Kind = "gridref", AnchorText = refName,
+                    Value1 = gx, Value2 = gy,
                     TokenName = GuessToken(line),
                 });
                 continue;
@@ -335,6 +528,8 @@ public static class IntelParser {
         var v = ParseFloat(m.Groups["dist"].Value);
         return m.Groups["unit"].Value is "米" or "m" ? v / 1000f : v;
     }
+
+    private static TrainScheduleRaw EnsureTrain(IntelDocument doc) => doc.Train ??= new TrainScheduleRaw();
 
     private static string? GuessToken(string line) {
         var lower = line.ToLowerInvariant();

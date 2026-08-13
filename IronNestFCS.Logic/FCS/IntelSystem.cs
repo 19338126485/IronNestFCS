@@ -53,6 +53,8 @@ public class IntelSystem {
         public bool Ignored;
         public GameObject? Marker;
         public GameObject? Label;
+        public bool IsMoving;              // 移动目标（列车/舰船）：位置随时间推进，Fire=定时开火
+        public MovingTrack? Track;
     }
     private readonly Dictionary<string, CandidateEntry> registry = new();
     private readonly List<CandidateEntry> insertionOrder = new();
@@ -103,6 +105,7 @@ public class IntelSystem {
     private Mesh? ringMesh;
     private Material? markerMatNormal;
     private Material? markerMatLowConf;
+    private Material? markerMatMoving;
 
     // 重型侦察 dump 每次会话只做一次（全场景 Transform 扫描会卡帧）。
     private bool diagDone;
@@ -129,6 +132,7 @@ public class IntelSystem {
         ringMesh = null;
         markerMatNormal = null;
         markerMatLowConf = null;
+        markerMatMoving = null;
         fcs = null;
     }
 
@@ -151,6 +155,7 @@ public class IntelSystem {
 
         if (fm == null) return;
         DetectManualPlacements();
+        UpdateMovingMarkers();
 
         // 自动车队触发不能依赖情报文本刷新：滑动停稳后可能再无新报文，
         // 触发评估会因此饿死（2026-08-13 实测：停稳 28 秒无任何文本，车队从未触发）。
@@ -195,6 +200,7 @@ public class IntelSystem {
         convoyTurretGrid = null;
         seenConvoyLines.Clear();
         pendingConvoyCons.Clear();
+        fcs?.Moving.ResetMission();
     }
 
     /// <summary>
@@ -287,6 +293,8 @@ public class IntelSystem {
         touchedKeys.Clear();
         SyncRegistry(results);
         RetractStaleAlts();
+        // 移动目标（列车/舰船）：时刻表/目击报告 → 行进路线 → 登记为自动推进位置的候选
+        fcs?.Moving.Ingest(doc, full);
         SyncCandidates();
         RebuildWindowLines();
 
@@ -739,7 +747,7 @@ public class IntelSystem {
     }
 
     // 地图边界（km）：全任务地图 20×10（列 A–T、行 1–10），留 0.5km 边距。
-    private static bool IsOnMap(Vector2 p) =>
+    internal static bool IsOnMap(Vector2 p) =>
         p.x is >= -0.5f and <= 20.5f && p.y is >= -0.5f and <= 10.5f;
 
     /// <summary>网格坐标 → 大格名（如 (6.6,4.85) → G5）。</summary>
@@ -810,6 +818,80 @@ public class IntelSystem {
                                 $"{(r.LowConfidence ? " [低置信度]" : "")}");
             }
         }
+    }
+
+    /// <summary>
+    /// 移动目标登记（MovingTargetSystem 调用）：与 SyncRegistry 同登记簿，同名原地更新。
+    /// 位置每秒由 UpdateMovingMarkers 按行进路线推进，此处不做"情报修正"日志。
+    /// </summary>
+    public void UpsertMovingCandidate(string key, string name, Vector2 point, string? tokenName, MovingTrack track) {
+        touchedKeys.Add(key);
+        if (registry.TryGetValue(key, out var e)) {
+            e.Cand.Point = point;
+            e.IsMoving = true;
+            e.Track = track;
+            e.Cand.Basis = track.Describe();
+            return;
+        }
+        var cand = new SurveyCandidate {
+            Name = name, Point = point, Score = 0f,
+            Basis = track.Describe(), TokenName = tokenName,
+        };
+        e = new CandidateEntry { Cand = cand, Seq = ++seqCounter, Key = key, IsMoving = true, Track = track };
+        registry[key] = e;
+        insertionOrder.Add(e);
+        CreateMarkerVisuals(e);
+        MelonLogger.Msg($"[Intel] 新移动目标 #{e.Seq}: [{name}] ({point.x:F2},{point.y:F2})");
+    }
+
+    /// <summary>移动目标除名（已摧毁等）：忽略并撤下标记。</summary>
+    public void RemoveMovingCandidate(string key, string reason) {
+        if (!registry.TryGetValue(key, out var e)) return;
+        e.Ignored = true;
+        DestroyVisuals(e);
+        MelonLogger.Msg($"[Intel] 移动目标移除: #{e.Seq} [{e.Cand.Name}]（{reason}）");
+        SyncCandidates();
+        RebuildWindowLines();
+    }
+
+    /// <summary>移动目标标记推进（Tick 每秒）：按行进路线重算位置，图外隐藏标记。</summary>
+    private float nextMovingMarkerUpdate;
+    private void UpdateMovingMarkers() {
+        if (fcs == null || Time.realtimeSinceStartup < nextMovingMarkerUpdate) return;
+        nextMovingMarkerUpdate = Time.realtimeSinceStartup + 1f;
+        var now = fcs.Moving.ScenarioNow();
+        if (now < 0f) return;
+        var any = false;
+        foreach (var e in insertionOrder) {
+            if (!e.IsMoving || e.Track == null || e.Placed || e.Ignored) continue;
+            any = true;
+            var p = e.Track.PositionAt(now);
+            e.Cand.Point = p;
+            if (e.Marker == null) continue;
+            var onMap = IsOnMap(p);
+            if (e.Marker.activeSelf != onMap) e.Marker.SetActive(onMap);
+            if (onMap) PositionMarker(e);
+        }
+        if (any) RebuildWindowLines(); // 窗口行的网格区号跟着走
+    }
+
+    /// <summary>
+    /// 网格坐标 → 射击诸元（方向角/距离）。与 MapTable.GetMarkTarget（T 按钮）完全相同的
+    /// 相对测量公式：仿射换算桌面局部坐标后与炮塔棋子取差。
+    /// </summary>
+    public bool TryGetFiringSolution(Vector2 grid, out float angle, out float dist) {
+        angle = 0f;
+        dist = 0f;
+        if (!affineReady || fcs == null) return false;
+        var surface = GameObject.Find("Draggable Surface")?.transform;
+        var turretLocal = fcs.MapTable.TurretLocalPos();
+        if (surface == null || turretLocal == null) return false;
+        var targetLocal = surface.InverseTransformPoint(AffineForward(grid));
+        var delta = targetLocal - turretLocal.Value;
+        dist = delta.magnitude * 3.8164f;
+        angle = Vector3.SignedAngle(delta, Vector3.up, Vector3.forward);
+        if (angle < 0) angle += 360;
+        return true;
     }
 
     /// <summary>
@@ -957,6 +1039,11 @@ public class IntelSystem {
             return;
         }
         var e = activeEntries[CurrentIndex];
+        // 移动目标（列车/舰船）：不打当前位置——自动选定预定打击点，装填完成后待机定时击发
+        if (e.IsMoving && e.Track != null) {
+            fcs.Moving.FireMovingTarget(e.Track);
+            return;
+        }
         // 与 GetMarkTarget 相同的公式：局部坐标差 → 距离×3.8164 / 方向角 SignedAngle
         var targetLocal = surface.InverseTransformPoint(AffineForward(e.Cand.Point));
         var delta = targetLocal - turretLocal.Value;
@@ -1117,7 +1204,7 @@ public class IntelSystem {
             var mf = go.AddComponent<MeshFilter>();
             mf.sharedMesh = GetRingMesh();
             var mr = go.AddComponent<MeshRenderer>();
-            mr.sharedMaterial = GetMarkerMaterial(e.Cand.LowConfidence);
+            mr.sharedMaterial = GetMarkerMaterial(e.Cand.LowConfidence, e.IsMoving);
 
             // 中心标杆：细圆柱穿透地图平面，两面都可见（环万一贴到背面也至少看得见杆）
             var pole = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
@@ -1127,7 +1214,7 @@ public class IntelSystem {
             pole.transform.localRotation = Quaternion.Euler(90f, 0f, 0f); // 圆柱 Y 轴 → local Z（穿透图面）
             pole.transform.localPosition = Vector3.zero;
             pole.transform.localScale = new Vector3(0.10f, 0.6f, 0.10f); // 相对环半径
-            FcsSceneInteractor.SetColor(pole, e.Cand.LowConfidence ? Color.yellow : Color.white);
+            FcsSceneInteractor.SetColor(pole, e.IsMoving ? Color.cyan : e.Cand.LowConfidence ? Color.yellow : Color.white);
 
             e.Marker = go;
             PositionMarker(e); // 先就位定标，后面的标签缩放要用 lossyScale
@@ -1217,12 +1304,13 @@ public class IntelSystem {
         return ringMesh;
     }
 
-    private Material GetMarkerMaterial(bool lowConfidence) {
+    private Material GetMarkerMaterial(bool lowConfidence, bool moving = false) {
         if (markerMatNormal == null) {
             markerMatNormal = CreateMarkerMaterial(new Color(1f, 1f, 1f, 1f));
             markerMatLowConf = CreateMarkerMaterial(new Color(1f, 0.85f, 0.1f, 1f));
+            markerMatMoving = CreateMarkerMaterial(new Color(0.2f, 0.9f, 1f, 1f)); // 移动目标=青色
         }
-        return (lowConfidence ? markerMatLowConf : markerMatNormal)!;
+        return (moving ? markerMatMoving : lowConfidence ? markerMatLowConf : markerMatNormal)!;
     }
 
     private static Material CreateMarkerMaterial(Color color) {
@@ -1399,7 +1487,7 @@ public class IntelSystem {
     /// 顺序：炮位别名 → 唯一友方实体（地面真值，含 #n 编号限定）→ 锚点字典（精确/包含匹配）。
     /// 敌方实体刻意不做锚点：它们的位置本身可能就是待解目标，直接读等于作弊。
     /// </summary>
-    private bool TryGetAnchorOptions(string anchorText, out List<Vector2> options) {
+    internal bool TryGetAnchorOptions(string anchorText, out List<Vector2> options) {
         options = new List<Vector2>();
         if (string.IsNullOrWhiteSpace(anchorText)) {
             if (TryGetTurretGrid(out var t)) options.Add(t);
@@ -1745,7 +1833,8 @@ public class IntelSystem {
             var mark = i == CurrentIndex ? ">" : " ";
             var zone = FcsWindow.ConvertPosition(new Vector3(c.Point.x, c.Point.y, 0f));
             var conf = c.LowConfidence ? " !" : "";
-            WindowLines.Add($"{mark}#{e.Seq} {zone}{conf} {Truncate(c.Name, 10)}");
+            var mv = e.IsMoving ? "»" : "";
+            WindowLines.Add($"{mark}#{e.Seq} {mv}{zone}{conf} {Truncate(c.Name, 10)}");
         }
         if (Candidates.Count > 6) {
             WindowLines.Add($"  ... +{Candidates.Count - 6} more");
