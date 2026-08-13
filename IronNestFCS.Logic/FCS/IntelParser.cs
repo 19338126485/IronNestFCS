@@ -53,7 +53,10 @@ public static class IntelParser {
     private static readonly Regex RichTag = new(@"<[^>]+>", RegexOptions.Compiled);
 
     // 网格坐标：名称 -/： 列字母+行号 子列:子行。列 A=0，行从 1 起，子格为格内第一位小数。
-    // 已验证：观测员#1 "M3 6:1" ↔ 实体 world (12.65, 2.15)。
+    // 取子格【中心】（+0.05km）：报文格只有 0.1km 精度，实体位于所指子格中央。
+    // 实测三组独立对照全部精确 +0.05："M3 6:1"→实体(12.65,2.15)；FO报点"G1 9:4"→FO实体(6.95,0.45)；
+    // "A1 0:2"→FO实体(0.05,0.25)。取角点则系统性偏 50~70m（2026-08-13 用户观测确认）。
+    private const float SubGridCenter = 0.05f;
     private static readonly Regex GridRef =
         new(@"^(?<name>.+?)\s*[-–—:：]\s*(?<col>[A-Za-z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)\s*$",
             RegexOptions.Compiled);
@@ -100,10 +103,10 @@ public static class IntelParser {
         new(@"(?<deg>\d{1,3})\s*自\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
             RegexOptions.Compiled);
 
-    /// <summary>裸网格坐标（无名称前缀，如 "H4 2:7"）→ 网格公里坐标，与 GridRef 行同一换算。</summary>
+    /// <summary>裸网格坐标（无名称前缀，如 "H4 2:7"）→ 网格公里坐标（子格中心），与 GridRef 行同一换算。</summary>
     private static (float gx, float gy) ParseBareGrid(Match m, string p) => (
-        char.ToUpperInvariant(m.Groups[p + "col"].Value[0]) - 'A' + ParseFloat(m.Groups[p + "sx"].Value) / 10f,
-        ParseFloat(m.Groups[p + "row"].Value) - 1f + ParseFloat(m.Groups[p + "sy"].Value) / 10f);
+        char.ToUpperInvariant(m.Groups[p + "col"].Value[0]) - 'A' + ParseFloat(m.Groups[p + "sx"].Value) / 10f + SubGridCenter,
+        ParseFloat(m.Groups[p + "row"].Value) - 1f + ParseFloat(m.Groups[p + "sy"].Value) / 10f + SubGridCenter);
 
     // 单位类型关键词 → 棋子名。棋子类型实测只有三种：
     // MapToken_Artillery（数字 1-10，FCS 打击目标）、MapToken_RefrencePoint（字母 A-E）、MapToken_Recon（数字 1-10）。
@@ -140,8 +143,8 @@ public static class IntelParser {
                 var col = char.ToUpperInvariant(m.Groups["col"].Value[0]) - 'A';
                 doc.Items.Add(new ParsedItem {
                     RawLine = line, Kind = "gridref", AnchorText = m.Groups["name"].Value.Trim(),
-                    Value1 = col + ParseFloat(m.Groups["sx"].Value) / 10f,
-                    Value2 = ParseFloat(m.Groups["row"].Value) - 1f + ParseFloat(m.Groups["sy"].Value) / 10f,
+                    Value1 = col + ParseFloat(m.Groups["sx"].Value) / 10f + SubGridCenter,
+                    Value2 = ParseFloat(m.Groups["row"].Value) - 1f + ParseFloat(m.Groups["sy"].Value) / 10f + SubGridCenter,
                     TokenName = GuessToken(line),
                 });
                 continue;
