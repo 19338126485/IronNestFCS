@@ -90,14 +90,8 @@ public class IntelSystem {
     /// <summary>车队解出的炮位（跨 Survey 持久化；纸带上的旧"铁巢"网格行不得将其覆盖，
     /// 否则确认后下一次 Survey 锚点回落、棋子被拽回旧位——2026-08-13 实测确诊）。</summary>
     private Vector2? convoyTurretGrid;
-    /// <summary>纸带上最新的大格公告（自动车队卡参数来源，每次 Survey 重读）。</summary>
+    /// <summary>纸带上最新的大格公告（车队卡参数的兜底来源，每次 Survey 重读）。</summary>
     private string? lastTurretZoneCell;
-    /// <summary>本轮 Survey 纸带上的大格公告总条数（新公告检测用）。</summary>
-    private int lastZoneItemCount;
-    /// <summary>检测到转移那一刻的公告条数快照：超过它 = 新公告已打印，才允许打卡。</summary>
-    private int zoneCountAtDetect;
-    /// <summary>本轮转移的新大格公告已打印（BuildCandidateResults 写入，车队触发读取）。</summary>
-    private bool newZoneAnnounced;
     /// <summary>转移轮次：每次检测到转移 +1，用于中止仍在跑的旧一轮车队打卡协程。</summary>
     public int RelocEpoch { get; private set; }
     /// <summary>出现过的车队报告行（原文去重）：区分新旧情报的唯一可靠依据。</summary>
@@ -193,9 +187,6 @@ public class IntelSystem {
         convoyTurretGrid = null;
         seenConvoyLines.Clear();
         pendingConvoyCons.Clear();
-        lastZoneItemCount = 0;
-        zoneCountAtDetect = 0;
-        newZoneAnnounced = false;
     }
 
     /// <summary>
@@ -207,11 +198,9 @@ public class IntelSystem {
         convoyTurretGrid = null; // 新一轮转移：旧车队解作废
         turretAnchorFromConvoy = false;
         turretRelocationPending = true;
-        zoneCountAtDetect = lastZoneItemCount; // 新公告条数必须超过此快照才允许打卡
-        newZoneAnnounced = false;
         RelocEpoch++;
         fcs?.Convoy.OnRelocationEpoch(); // 新一轮：重置车队卡的"失败不再重试"记录
-        MelonLogger.Msg("[Intel] 铁巢已转移：旧炮位锚点作废，等待新大格公告（公告打印后才打车队卡）");
+        MelonLogger.Msg("[Intel] 铁巢已转移：旧炮位锚点作废，滑动停稳后自动打车队卡");
         Survey(full: false);
     }
 
@@ -293,14 +282,17 @@ public class IntelSystem {
         SyncCandidates();
         RebuildWindowLines();
 
-        // 自动后勤车队：转移未定位 + 新大格公告已打印 + 开关开 → 触发打卡循环（已在跑则忽略）。
-        // 公告未打印前不打卡（实测：公告未出就用旧大格打卡，得到的全是旧信息）。
+        // 自动后勤车队：转移未定位 + 滑动已结束 + 开关开 → 触发打卡循环（已在跑则忽略）。
+        // 大格参数首选炮位图标直接换算（永远准确、零延迟；1km 粒度与公告同级信息，非作弊），
+        // 纸带公告仅作兜底。打卡等滑动结束：途中打卡会得到移动中的过期几何（实测）。
         if (turretRelocationPending && fcs != null && fcs.Convoy.AutoConvoy && !fcs.Convoy.NestGps) {
-            if (newZoneAnnounced && lastTurretZoneCell != null) {
-                fcs.Convoy.RequestConvoyIntel(lastTurretZoneCell, RelocEpoch);
+            if (!fcs.Convoy.TurretInTransit && TryGetCurrentTurretZone(out var zone)) {
+                fcs.Convoy.RequestConvoyIntel(zone, RelocEpoch);
             }
-            else if (full && !newZoneAnnounced) {
-                MelonLogger.Msg("[Intel] 等待新大格公告打印，之后自动打车队卡");
+            else if (full) {
+                MelonLogger.Msg(fcs.Convoy.TurretInTransit
+                    ? "[Intel] 铁巢滑动中，停稳后自动打车队卡"
+                    : "[Intel] 铁巢已转移但大格未知（图标换算失败且无公告），暂不打卡");
             }
         }
 
@@ -625,20 +617,15 @@ public class IntelSystem {
         // 每条报告是对铁巢的一条几何约束（距离圆/方位线，锚点坐标行内自带）；
         // 唯一解才接受（双解歧义时等更多报告，由 AutoConvoy 继续打卡）。
         //
-        // 新旧情报分界（2026-08-13 三次实测教训）：
-        //  - 纸带是【倒序】的（新行在上）：最新大格公告 = 第一条 turretZone 条目；
-        //  - 同一任务可能多次转移到【同一大格】（公告文本逐字相同），靠文本变化区分不可行，
-        //    但公告【条数】会 +1——计数是区分"新公告是否已打印"的唯一可靠信号；
-        //  - 报告行靠 seenConvoyLines 去重：转移待定期间只累积首次出现的行。
-        //  - 打卡时机：新公告【条数】超过检测到转移时的快照才允许打卡（用户实测：
-        //    公告未出就用旧大格打卡，得到的全是旧信息）。
+        // 新旧情报分界（2026-08-13 四次实测教训）：
+        //  - 报告行靠 seenConvoyLines 去重：转移待定期间只累积首次出现的行（顺序无关、同格无关）；
+        //  - 大格公告只作车队卡参数的【兜底】：公告打印有队列延迟、会滚动、会重印，
+        //    实测曾因此拿到过期大格打卡——首选参数改由炮位图标直接换算（见 TryGetCurrentTurretZone）。
         var turretCons = pendingConvoyCons; // 本轮转移的累积约束（跨 Survey 保留）
         var fresh = 0;
-        var zoneItemCount = 0;
         string? newestZoneCell = null;
         foreach (var item in doc.Items) {
             if (item.Kind == "turretZone") {
-                zoneItemCount++;
                 newestZoneCell ??= item.AnchorText; // 纸带倒序：第一条即最新公告
                 continue;
             }
@@ -663,11 +650,7 @@ public class IntelSystem {
         if (verbose && fresh > 0) {
             MelonLogger.Msg($"[Intel] 新增 {fresh} 条车队报告（本轮累计 {turretCons.Count} 条约束）");
         }
-        lastZoneItemCount = zoneItemCount;
         if (newestZoneCell != null) lastTurretZoneCell = newestZoneCell;
-        if (zoneCountAtDetect > zoneItemCount) zoneCountAtDetect = zoneItemCount; // 纸带滚出兜底
-        // 本轮转移的新大格公告是否已打印（打卡时机闸门，供 Survey 末尾的车队触发用）
-        newZoneAnnounced = zoneItemCount > zoneCountAtDetect;
 
         if (turretRelocationPending && turretCons.Count >= 2) {
             var solved = GeoSolver.Solve(turretCons);
@@ -746,6 +729,34 @@ public class IntelSystem {
     // 地图边界（km）：全任务地图 20×10（列 A–T、行 1–10），留 0.5km 边距。
     private static bool IsOnMap(Vector2 p) =>
         p.x is >= -0.5f and <= 20.5f && p.y is >= -0.5f and <= 10.5f;
+
+    /// <summary>网格坐标 → 大格名（如 (6.6,4.85) → G5）。</summary>
+    private static string ZoneName(Vector2 p) {
+        var col = Mathf.Clamp(Mathf.FloorToInt(p.x), 0, 25);
+        var row = Mathf.Max(1, Mathf.FloorToInt(p.y) + 1);
+        return $"{(char)('A' + col)}{row}";
+    }
+
+    /// <summary>
+    /// 当前炮位所在大格（车队卡参数）：炮位图标世界坐标逆仿射换算。1km 粒度，
+    /// 与大格公告最终会告知的信息同级（非作弊），但零延迟、不随纸带滚动丢失。
+    /// 图标不可用/越界时兜底为纸带最新公告。
+    /// </summary>
+    public bool TryGetCurrentTurretZone(out string zone) {
+        zone = "";
+        if (affineReady && fcs != null && fcs.Convoy.TryGetNestGpsWorld(out var w)) {
+            var g = AffineInverse(w);
+            if (IsOnMap(g)) {
+                zone = ZoneName(g);
+                return true;
+            }
+        }
+        if (lastTurretZoneCell != null) {
+            zone = lastTurretZoneCell;
+            return true;
+        }
+        return false;
+    }
 
     /// <summary>
     /// 把本次解算结果同步进登记簿：同名条目原地更新（保留 已落子/已忽略 状态），
@@ -1038,7 +1049,7 @@ public class IntelSystem {
     /// <summary>
     /// 自动落炮塔棋子（每次 Survey 末尾执行，幂等）：报文"铁巢"网格行是每个任务必报的真值，
     /// 而棋子通常停在托盘默认位——此时 T1~T4 按钮与 Fire 的相对测量（local 差值公式）全部失真。
-    /// 偏差 >0.05km 才移动；玩家已手动摆好（误差在报文 0.1km 舍入范围内）则不打扰。
+    /// 偏差 >0.12km 才移动（阈值含正逆仿射往返误差）；玩家已手动摆好则不打扰。
     /// </summary>
     private void EnsureTurretPiecePlaced() {
         if (!affineReady) return;
@@ -1054,7 +1065,8 @@ public class IntelSystem {
         if (surface == null || piece == null) return;
 
         var currentGrid = AffineInverse(piece.position);
-        if (Vector2.Distance(currentGrid, grid) <= 0.05f) return; // 已在正确位置
+        // 阈值要大于正逆仿射的往返误差（实测 ~0.08km），否则会反复微挪棋子
+        if (Vector2.Distance(currentGrid, grid) <= 0.12f) return; // 已在正确位置
 
         var local = surface.InverseTransformPoint(AffineForward(grid));
         piece.localPosition = new Vector3(local.x, local.y, piece.localPosition.z);

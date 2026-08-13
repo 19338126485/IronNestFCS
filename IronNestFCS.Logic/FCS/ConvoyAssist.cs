@@ -35,10 +35,17 @@ public class ConvoyAssist {
     private float nextPollTime;
     private bool hasBaseline;
     private Vector3 lastIconPos;
-    private bool inTransit;      // 转移移动是持续数十秒的滑动：整个episode只通报一次
+    private bool inTransit;      // 转移移动是间歇性步进滑动（实测步间停顿 3~4s）：整个 episode 只通报一次
     private float lastMoveTime;
     private TurretLocationIcon? cachedIcon;
     private IntPtr lastMissionPtr;
+
+    /// <summary>炮位图标是否仍在滑动途中（车队打卡要等滑动真正结束）。</summary>
+    public bool TurretInTransit => inTransit;
+
+    /// <summary>滑动结束判定：静止超过该时长才算一次转移完成。
+    /// 实测转移是间歇性步进（每步停 3~4 秒），3 秒阈值会把一次转移切成好几段。</summary>
+    private const float TransitSettleSeconds = 8f;
 
     // 自动车队循环
     private bool convoyRunning;
@@ -125,7 +132,7 @@ public class ConvoyAssist {
             }
             return; // 滑动途中不重复通报（实测转移是持续数十秒的连续滑动）
         }
-        if (inTransit && Time.realtimeSinceStartup - lastMoveTime > 3f) {
+        if (inTransit && Time.realtimeSinceStartup - lastMoveTime > TransitSettleSeconds) {
             inTransit = false;
             MelonLogger.Msg($"[Convoy] 转移滑动结束: 图标停在 {Fmt(iconPos)}");
         }
