@@ -475,7 +475,7 @@ public class IntelSystem {
                     var p = posByAnchor[item.AnchorText];
                     var name = string.IsNullOrWhiteSpace(item.AnchorText) ? "Turret" : item.AnchorText;
                     constraints.Add(item.Kind == "bearing"
-                        ? new BearingLine { Origin = p, BearingDeg = item.Value1, AnchorName = name }
+                        ? new BearingLine { Origin = p, BearingDeg = item.Value1, AnchorName = name, Fuzzy = item.Fuzzy }
                         : new DistanceCircle { Center = p, RadiusKm = item.Value1, AnchorName = name });
                 }
                 if (foExtra != null) constraints.AddRange(foExtra); // FO 圆无锚点，每个分支组合都一样

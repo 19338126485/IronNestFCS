@@ -23,6 +23,8 @@ public sealed class BearingLine : IGeoConstraint {
     public Vector2 Origin;
     public float BearingDeg;
     public string AnchorName = "";
+    /// <summary>模糊方位（罗盘方位词，±11°）：由它参与产生的候选一律标低置信度。</summary>
+    public bool Fuzzy;
 
     public Vector2 Dir => new(Mathf.Sin(BearingDeg * Mathf.Deg2Rad), Mathf.Cos(BearingDeg * Mathf.Deg2Rad));
 
@@ -148,7 +150,8 @@ public static class GeoSolver {
                         Point = p,
                         Score = score,
                         Basis = basis,
-                        LowConfidence = PairConfidence(constraints[i], constraints[j], p) < LowConfidenceThreshold,
+                        LowConfidence = PairConfidence(constraints[i], constraints[j], p) < LowConfidenceThreshold
+                                        || IsFuzzy(constraints[i]) || IsFuzzy(constraints[j]),
                     });
                 }
             }
@@ -175,6 +178,8 @@ public static class GeoSolver {
             return Mathf.Abs(Cross((p - ca2.Center).normalized, (p - cb2.Center).normalized));
         return 1f;
     }
+
+    private static bool IsFuzzy(IGeoConstraint c) => c is BearingLine { Fuzzy: true };
 
     private static float Cross(Vector2 u, Vector2 v) => u.x * v.y - u.y * v.x;
 

@@ -16,7 +16,8 @@ public sealed class ParsedItem {
     public string AnchorText = ""; // 锚点名（如 观测员#1），空 = 炮位；turretZone 时存大格编号（如 H4）
     public float Value1;
     public float Value2;
-    public float Value3;           // turretDist/turretBearing：Value1=距离/角度, Value2=报点x, Value3=报点y
+    public float Value3;           // turretDist/turretBearing/foDist/foBearing：Value1=距离/角度, Value2=报点x, Value3=报点y
+    public bool Fuzzy;             // 模糊约束（罗盘方位词，±11°）：解算照旧但候选标低置信度
     public string? TokenName;      // 行内识别出的棋子类型名
 }
 
@@ -98,6 +99,28 @@ public static class IntelParser {
         new(@"^FO.*?发现\s*(?<name>.+?)\s*[:：]\s*(?<deg>\d{1,3})\s*自\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
             RegexOptions.Compiled);
 
+    // ===== 活动报告（观测员三角测量，2026-08-13 实测样本） =====
+    // 一组格式：汇总行"报告活动于坐标 B10" + 每个观测员一行测量：
+    //   "观测员#2：8.91km"（距离）/ "观测员#3：254°"（方位角）/ "观测员#1：西北偏西"（罗盘方位词，±11°模糊）
+    // 实测纸带（倒序）：汇总行在测量行【之上】（汇总后打印），归属给解析顺序中紧随其后的测量块。
+    private static readonly Regex ActivityHeader =
+        new(@"报告活动于坐标\s*(?<cell>[A-Z]\d{1,2})", RegexOptions.Compiled);
+    private static readonly Regex ActivityDist =
+        new(@"^(?<anchor>[^\s：:]+)：\s*(?<dist>[\d.]+)\s*(?<unit>km|公里|千米)\s*$", RegexOptions.Compiled);
+    private static readonly Regex ActivityBearing =
+        new(@"^(?<anchor>[^\s：:]+)：\s*(?<deg>\d{1,3})\s*°\s*$", RegexOptions.Compiled);
+    private static readonly Regex ActivityCompass =
+        new(@"^(?<anchor>[^\s：:]+)：\s*(?<dir>[北东南西偏]+)\s*$", RegexOptions.Compiled);
+
+    /// <summary>中文十六向罗盘词 → 方位角（罗盘约定：0=北，顺时针）。偏词两种写法都收（西偏北/西北偏西）。</summary>
+    private static readonly (string word, float deg)[] CompassWords = {
+        ("北偏东", 22.5f), ("东北", 45f), ("东偏北", 67.5f), ("东", 90f),
+        ("东偏南", 112.5f), ("东南", 135f), ("南偏东", 157.5f), ("南", 180f),
+        ("南偏西", 202.5f), ("西南", 225f), ("西偏南", 247.5f), ("西", 270f),
+        ("西偏北", 292.5f), ("西北偏西", 292.5f), ("西北", 315f), ("北偏西", 337.5f),
+        ("北", 0f),
+    };
+
     // "车队#3发现铁巢: <风味文本> 180 自 H4 2:7 . . ." —— 方位线约束（起点=报点，结构为"<度> 自 <格>"）
     private static readonly Regex ConvoyBearing =
         new(@"(?<deg>\d{1,3})\s*自\s*(?<col>[A-Z])(?<row>\d{1,2})\s+(?<sx>\d)\s*[:：]\s*(?<sy>\d)",
@@ -133,9 +156,77 @@ public static class IntelParser {
         if (string.IsNullOrWhiteSpace(text)) return doc;
 
         IntelSubject? current = null;
+        List<ParsedItem>? activityBlock = null;  // 活动报告的连续测量行（归属最近的 pendingCell）
+        string? pendingCell = null;
+
+        // 测量块收尾：汇成一个主题（命名用 pendingCell，无则匿名）
+        void FlushActivity() {
+            if (activityBlock == null) return;
+            var subject = new IntelSubject {
+                Name = pendingCell != null ? $"活动@{pendingCell}" : "活动报告",
+                TokenName = "MapToken_Artillery",
+            };
+            subject.Constraints.AddRange(activityBlock);
+            doc.Subjects.Add(subject);
+            activityBlock = null;
+            pendingCell = null;
+        }
+
+        // 加入一行测量。同一锚点在块内重复 = 新一轮测量（每批每个观测员恰好一行），先收尾再开新块。
+        void AddActivity(ParsedItem item) {
+            if (activityBlock != null) {
+                foreach (var it in activityBlock) {
+                    if (it.AnchorText == item.AnchorText) { FlushActivity(); break; }
+                }
+            }
+            (activityBlock ??= new List<ParsedItem>()).Add(item);
+        }
+
         foreach (var rawLine in text.Split('\n')) {
             var line = RichTag.Replace(rawLine, "").Trim();
             if (line.Length == 0 || line == "." || line == "- - -") continue;
+
+            // ===== 活动报告（观测员三角测量） =====
+            // 汇总行："报告活动于坐标 B10"（归属给解析顺序中紧随其后的测量块）
+            var mAct = ActivityHeader.Match(line);
+            if (mAct.Success) {
+                FlushActivity();
+                pendingCell = mAct.Groups["cell"].Value;
+                continue;
+            }
+            // 测量行：距离 / 方位角 / 罗盘方位词（模糊）
+            var ma = ActivityDist.Match(line);
+            if (ma.Success) {
+                AddActivity(new ParsedItem {
+                    RawLine = line, Kind = "distance", AnchorText = ma.Groups["anchor"].Value.Trim(),
+                    Value1 = ToKm(ma),
+                });
+                continue;
+            }
+            ma = ActivityBearing.Match(line);
+            if (ma.Success) {
+                AddActivity(new ParsedItem {
+                    RawLine = line, Kind = "bearing", AnchorText = ma.Groups["anchor"].Value.Trim(),
+                    Value1 = ParseFloat(ma.Groups["deg"].Value),
+                });
+                continue;
+            }
+            ma = ActivityCompass.Match(line);
+            if (ma.Success) {
+                var deg = -1f;
+                foreach (var (word, d) in CompassWords) {
+                    if (ma.Groups["dir"].Value == word) { deg = d; break; }
+                }
+                if (deg >= 0f) {
+                    AddActivity(new ParsedItem {
+                        RawLine = line, Kind = "bearing", AnchorText = ma.Groups["anchor"].Value.Trim(),
+                        Value1 = deg, Fuzzy = true,
+                    });
+                    continue;
+                }
+                // 未收录的罗盘词：落入未解析日志取样
+            }
+            else FlushActivity(); // 非测量行：测量块结束
 
             // 网格坐标行（锚点/直接定位）
             var m = GridRef.Match(line);
@@ -261,6 +352,7 @@ public static class IntelParser {
                 MelonLogger.Msg($"[Intel] 未能解析的行({sourceTag}): {line}");
             }
         }
+        FlushActivity(); // 文本末尾可能还挂着一组测量行
         return doc;
     }
 
